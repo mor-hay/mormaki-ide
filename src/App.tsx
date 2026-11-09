@@ -59,6 +59,9 @@ export default function App() {
   const [usage, setUsage] = useState<any>();
   const [context, setContext] = useState<ContextChip[]>([]);
   const [chatFocus, setChatFocus] = useState(0);
+  const [effort, setEffort] = useState(() => localStorage.getItem("mormaki_effort") ?? "");
+  const resumeRef = useRef<{ root: string; sessionId: string } | null>(null);
+  const sessionIdRef = useRef<string | undefined>(undefined);
 
   const [changes, setChanges] = useState<Record<string, Change>>({});
   const [review, setReview] = useState<{ path: string; before: string; after: string } | null>(null);
@@ -82,7 +85,7 @@ export default function App() {
 
   const push = useCallback((item: ChatItem) => setItems((xs) => [...xs, item]), []);
 
-  const appendText = useCallback((kind: "agent" | "thought", text: string) => {
+  const appendText = useCallback((kind: "agent" | "thought" | "user", text: string) => {
     setItems((xs) => {
       const last = xs[xs.length - 1];
       if (last?.kind === kind) return [...xs.slice(0, -1), { kind, text: last.text + text }];
@@ -181,6 +184,9 @@ export default function App() {
   const onUpdate = useCallback(
     (u: SessionUpdate) => {
       switch (u.sessionUpdate) {
+        case "user_message_chunk":
+          if (u.content?.type === "text") appendText("user", u.content.text);
+          break;
         case "agent_message_chunk":
           if (u.content?.type === "text") appendText("agent", u.content.text);
           break;
@@ -240,17 +246,31 @@ export default function App() {
       onExit: () => !cancelled && push({ kind: "error", text: "maki acp exited" }),
     });
     acpRef.current = client;
+    const resume = resumeRef.current?.root === root ? resumeRef.current.sessionId : undefined;
+    resumeRef.current = null;
     setItems([]);
     setSessionId(undefined);
     (async () => {
       try {
-        await client.start(root);
-        const s = await client.newSession(root);
+        await client.start(root, effort);
+        let s: { sessionId?: string; modes?: any; configOptions?: ConfigOption[] } | null = null;
+        if (resume) {
+          try {
+            s = (await client.loadSession(resume, root)) ?? {};
+            s.sessionId = resume;
+          } catch (e) {
+            if (!cancelled) push({ kind: "error", text: `Could not resume chat, started a new one: ${String(e)}` });
+          }
+        }
+        if (!s) s = await client.newSession(root);
         if (cancelled) return;
         setSessionId(s.sessionId);
-        setModes(s.modes?.availableModes ?? []);
-        setMode(s.modes?.currentModeId);
-        setModel(s.configOptions?.find((o) => o.id === "model"));
+        if (s.modes) {
+          setModes(s.modes.availableModes ?? []);
+          setMode(s.modes.currentModeId);
+        }
+        const m = s.configOptions?.find((o) => o.id === "model");
+        if (m) setModel(m);
       } catch (e) {
         if (!cancelled) {
           const msg = String(e);
@@ -268,7 +288,18 @@ export default function App() {
       cancelled = true;
       client.dispose();
     };
-  }, [root, onUpdate, push, showToast]);
+  }, [root, effort, onUpdate, push, showToast]);
+
+  sessionIdRef.current = sessionId;
+  const changeEffort = useCallback(
+    (next: string) => {
+      if (next === effort || busy) return;
+      if (root && sessionIdRef.current) resumeRef.current = { root, sessionId: sessionIdRef.current };
+      localStorage.setItem("mormaki_effort", next);
+      setEffort(next);
+    },
+    [effort, busy, root],
+  );
 
   const startNewChat = useCallback(async () => {
     const client = acpRef.current;
@@ -871,6 +902,8 @@ export default function App() {
           )
         }
         usage={usage}
+        effort={effort}
+        onEffort={changeEffort}
         focusKey={chatFocus}
       />
 

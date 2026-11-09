@@ -58,19 +58,39 @@ fn find_maki() -> PathBuf {
 }
 
 #[tauri::command]
-fn acp_start(app: AppHandle, state: State<AcpState>, cwd: String) -> Result<u64, String> {
+fn acp_start(
+    app: AppHandle,
+    state: State<AcpState>,
+    cwd: String,
+    thinking: Option<String>,
+) -> Result<u64, String> {
     if !Path::new(&cwd).is_dir() {
         return Err(format!("workspace directory does not exist: {cwd}"));
     }
     let mut acp = state.lock().unwrap();
     acp.stdin.take();
     if let Some(mut old) = acp.child.take() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = old.try_wait() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let _ = old.kill();
         let _ = old.wait();
     }
-    let mut child = Command::new(find_maki())
-        .arg("acp")
-        .current_dir(&cwd)
+    let mut cmd = Command::new(find_maki());
+    cmd.arg("acp").current_dir(&cwd);
+    match thinking.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() => {
+            cmd.env("MORMAKI_THINKING", t);
+        }
+        _ => {
+            cmd.env_remove("MORMAKI_THINKING");
+        }
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

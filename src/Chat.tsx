@@ -42,6 +42,8 @@ interface Props {
   modes: { id: string; name: string }[];
   onMode: (id: string) => void;
   usage?: { used: number; size: number; cost?: { amount: number } };
+  effort: string;
+  onEffort: (v: string) => void;
   focusKey: number;
 }
 
@@ -203,6 +205,143 @@ function ToolCard({
   );
 }
 
+const shortName = (v: string) => v.replace(/^[^/]+\//, "").replace(/^claude-/, "").replace(/-1m$/, "");
+
+export const EFFORTS = [
+  { value: "", label: "Default", hint: "maki's last /thinking level" },
+  { value: "off", label: "Off", hint: "No thinking, fastest" },
+  { value: "low", label: "Low", hint: "Light reasoning" },
+  { value: "medium", label: "Medium", hint: "Balanced" },
+  { value: "high", label: "High", hint: "Deep reasoning" },
+  { value: "max", label: "Max", hint: "Maximum reasoning, slowest" },
+];
+
+function usePopover() {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [open]);
+  return { open, setOpen, ref };
+}
+
+function EffortPicker({ value, disabled, onPick }: { value: string; disabled: boolean; onPick: (v: string) => void }) {
+  const { open, setOpen, ref } = usePopover();
+  const cur = EFFORTS.find((e) => e.value === value) ?? EFFORTS[0];
+  return (
+    <div className="model-picker" ref={ref}>
+      <button
+        className={"model-btn effort-btn effort-" + (cur.value || "default")}
+        disabled={disabled}
+        title="Reasoning effort (restarts maki and resumes this chat)"
+        onClick={() => setOpen(!open)}
+      >
+        🧠 {cur.label}
+        <span className="caret">▾</span>
+      </button>
+      {open && (
+        <div className="model-pop effort-pop">
+          <div className="model-group">Reasoning effort</div>
+          {EFFORTS.map((e) => (
+            <div
+              key={e.value}
+              className={"model-item" + (e.value === value ? " current" : "")}
+              onMouseDown={(ev) => {
+                ev.preventDefault();
+                setOpen(false);
+                onPick(e.value);
+              }}
+            >
+              <span className={"effort-bars effort-" + (e.value || "default")} />
+              <span>{e.label}</span>
+              <span className="effort-hint">{e.hint}</span>
+              {e.value === value && <span className="check">✓</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ModelPicker({ model, disabled, onPick }: { model: ConfigOption; disabled: boolean; onPick: (v: string) => void }) {
+  const { open, setOpen, ref } = usePopover();
+  const [q, setQ] = useState("");
+  const [idx, setIdx] = useState(0);
+
+  const list = useMemo(() => {
+    const values = model.options.map((o) => o.value);
+    if (!values.includes(model.currentValue)) values.unshift(model.currentValue);
+    const terms = q.toLowerCase().replace(/\./g, "-").split(/\s+/).filter(Boolean);
+    return values
+      .filter((v) => terms.every((t) => v.toLowerCase().includes(t)))
+      .sort((a, b) => {
+        const pa = a.split("/")[0], pb = b.split("/")[0];
+        if (pa !== pb) return pa.localeCompare(pb);
+        return b.localeCompare(a, undefined, { numeric: true });
+      });
+  }, [model, q]);
+
+  const pick = (v: string) => {
+    setOpen(false);
+    setQ("");
+    if (v !== model.currentValue) onPick(v);
+  };
+
+  const cur = model.currentValue;
+  return (
+    <div className="model-picker" ref={ref}>
+      <button className="model-btn" disabled={disabled} title={cur} onClick={() => { setOpen(!open); setIdx(0); }}>
+        {shortName(cur)}
+        {cur.endsWith("-1m") && <span className="badge-1m">1M</span>}
+        <span className="caret">▾</span>
+      </button>
+      {open && (
+        <div className="model-pop">
+          <input
+            autoFocus
+            value={q}
+            placeholder={`Search ${model.options.length} models… (e.g. opus 5.5 1m)`}
+            onChange={(e) => { setQ(e.target.value); setIdx(0); }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setOpen(false);
+              else if (e.key === "ArrowDown") { e.preventDefault(); setIdx((i) => Math.min(i + 1, list.length - 1)); }
+              else if (e.key === "ArrowUp") { e.preventDefault(); setIdx((i) => Math.max(i - 1, 0)); }
+              else if (e.key === "Enter" && list[idx]) pick(list[idx]);
+            }}
+          />
+          <div className="model-list">
+            {list.length === 0 && <div className="quick-empty">No matching models</div>}
+            {list.map((v, i) => {
+              const provider = v.split("/")[0];
+              const header = i === 0 || list[i - 1].split("/")[0] !== provider;
+              return (
+                <div key={v}>
+                  {header && <div className="model-group">{provider}</div>}
+                  <div
+                    className={"model-item" + (i === idx ? " active" : "") + (v === cur ? " current" : "")}
+                    onMouseEnter={() => setIdx(i)}
+                    onMouseDown={(e) => { e.preventDefault(); pick(v); }}
+                  >
+                    <span>{shortName(v)}</span>
+                    {v.endsWith("-1m") && <span className="badge-1m">1M</span>}
+                    {v === cur && <span className="check">✓</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Chat(p: Props) {
   const [input, setInput] = useState("");
   const [images, setImages] = useState<PastedImage[]>([]);
@@ -303,31 +442,15 @@ export default function Chat(p: Props) {
           <span className={"status-dot " + (p.ready ? (p.busy ? "busy" : "ready") : "offline")} />
           maki
         </span>
-        <select value={p.mode ?? ""} onChange={(e) => p.onMode(e.target.value)} disabled={!p.ready} title="Mode">
+        <select value={p.mode ?? ""} onChange={(e) => p.onMode(e.target.value)} disabled={!p.ready || p.busy} title="Mode">
           {p.modes.map((m) => (
             <option key={m.id} value={m.id}>
               {m.name}
             </option>
           ))}
         </select>
-        {p.model && (
-          <select
-            value={p.model.currentValue}
-            onChange={(e) => p.onModel(e.target.value)}
-            disabled={!p.ready}
-            title={p.model.currentValue}
-          >
-            {p.model.options.map((o) => {
-              const is1M = o.value.endsWith("-1m");
-              const label = o.name.replace(/^anthropic\/|^google\/|^openai\//, "");
-              return (
-                <option key={o.value} value={o.value}>
-                  {is1M ? `${label.replace(/-1m$/, "")} (1M tokens)` : label}
-                </option>
-              );
-            })}
-          </select>
-        )}
+        {p.model && <ModelPicker model={p.model} disabled={!p.ready || p.busy} onPick={p.onModel} />}
+        <EffortPicker value={p.effort} disabled={!p.ready || p.busy} onPick={p.onEffort} />
         {modelVariants && (
           <button
             className={"ctx-toggle-btn" + (modelVariants.is1M ? " active" : "")}

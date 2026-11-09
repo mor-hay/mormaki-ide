@@ -69,7 +69,7 @@ export class AcpClient {
 
   constructor(private handlers: AcpHandlers) {}
 
-  async start(cwd: string) {
+  async start(cwd: string, thinking?: string) {
     this.dispose();
     this.disposed = false;
     this.unlisten.push(
@@ -82,7 +82,7 @@ export class AcpClient {
         this.handlers.onExit?.();
       }),
     );
-    this.generation = await invoke<number>("acp_start", { cwd });
+    this.generation = await invoke<number>("acp_start", { cwd, thinking: thinking || null });
     await this.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
@@ -99,6 +99,10 @@ export class AcpClient {
 
   newSession(cwd: string): Promise<SessionInfo> {
     return this.request("session/new", { cwd, mcpServers: [] });
+  }
+
+  loadSession(sessionId: string, cwd: string): Promise<SessionInfo | null> {
+    return this.request("session/load", { sessionId, cwd, mcpServers: [] });
   }
 
   prompt(sessionId: string, prompt: ContentBlock[]): Promise<{ stopReason: string }> {
