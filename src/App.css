@@ -449,3 +449,11 @@ kbd {
 }
 .ctx-item:hover { background: var(--accent-soft); color: #fff; }
 .ctx-item > span:first-child { width: 16px; text-align: center; font-family: monospace; color: #93c5fd; }
+
+.ctx-toggle-btn {
+  padding: 2px 6px; font-size: 10.5px; font-weight: 700; font-family: monospace;
+  border-radius: 4px; background: var(--bg3); color: var(--dim); border: 1px solid var(--border);
+}
+.ctx-toggle-btn.active {
+  background: var(--accent-soft); color: #93c5fd; border-color: rgba(59, 130, 246, 0.45);
+}

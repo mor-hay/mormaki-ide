@@ -283,6 +283,19 @@ export default function Chat(p: Props) {
 
   const pct = p.usage && p.usage.size > 0 ? Math.min(100, Math.round((p.usage.used / p.usage.size) * 100)) : 0;
 
+  const modelVariants = useMemo(() => {
+    if (!p.model) return null;
+    const cur = p.model.currentValue;
+    const base = cur.replace(/-1m$/, "");
+    const oneM = `${base}-1m`;
+    const hasBase = p.model.options.some((o) => o.value === base);
+    const has1M = p.model.options.some((o) => o.value === oneM);
+    if (hasBase && has1M) {
+      return { base, oneM, is1M: cur === oneM };
+    }
+    return null;
+  }, [p.model]);
+
   return (
     <div className="chat">
       <div className="pane-title chat-head">
@@ -304,12 +317,30 @@ export default function Chat(p: Props) {
             disabled={!p.ready}
             title={p.model.currentValue}
           >
-            {p.model.options.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.name.replace(/^anthropic\/|^google\/|^openai\//, "")}
-              </option>
-            ))}
+            {p.model.options.map((o) => {
+              const is1M = o.value.endsWith("-1m");
+              const label = o.name.replace(/^anthropic\/|^google\/|^openai\//, "");
+              return (
+                <option key={o.value} value={o.value}>
+                  {is1M ? `${label.replace(/-1m$/, "")} (1M tokens)` : label}
+                </option>
+              );
+            })}
           </select>
+        )}
+        {modelVariants && (
+          <button
+            className={"ctx-toggle-btn" + (modelVariants.is1M ? " active" : "")}
+            title={
+              modelVariants.is1M
+                ? "Using 1M token context window (click to switch to 200K)"
+                : "Using standard 200K context window (click to switch to 1M tokens)"
+            }
+            disabled={!p.ready || p.busy}
+            onClick={() => p.onModel(modelVariants.is1M ? modelVariants.base : modelVariants.oneM)}
+          >
+            {modelVariants.is1M ? "1M" : "200K"}
+          </button>
         )}
         <button className="icon-btn" title="New Chat Session" onClick={p.onNewChat} disabled={!p.ready || p.busy}>
           ＋
