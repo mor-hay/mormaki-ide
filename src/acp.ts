@@ -14,6 +14,7 @@ export type ToolCallContent =
 
 export interface ToolCall {
   toolCallId: string;
+  toolName?: string;
   title?: string;
   kind?: string;
   status?: "pending" | "in_progress" | "completed" | "failed";
@@ -59,42 +60,65 @@ export interface AcpHandlers {
 }
 
 type Pending = { resolve: (v: any) => void; reject: (e: any) => void };
+type ProcLine = { id: number; line: string };
 
 export class AcpClient {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private unlisten: UnlistenFn[] = [];
-  private generation = -1;
+  private procId = -1;
   private disposed = false;
 
   constructor(private handlers: AcpHandlers) {}
 
   async start(cwd: string, thinking?: string) {
-    this.dispose();
-    this.disposed = false;
     this.unlisten.push(
-      await listen<string>("acp://message", (e) => !this.disposed && this.onLine(e.payload)),
-      await listen<string>("acp://stderr", (e) => !this.disposed && this.handlers.onStderr?.(e.payload)),
+      await listen<ProcLine>("acp://message", (e) => {
+        if (!this.disposed && e.payload.id === this.procId) this.onLine(e.payload.line);
+      }),
+      await listen<ProcLine>("acp://stderr", (e) => {
+        if (!this.disposed && e.payload.id === this.procId) this.handlers.onStderr?.(e.payload.line);
+      }),
       await listen<number>("acp://exit", (e) => {
-        if (this.disposed || e.payload !== this.generation) return;
+        if (this.disposed || e.payload !== this.procId) return;
         for (const p of this.pending.values()) p.reject(new Error("maki acp exited"));
         this.pending.clear();
         this.handlers.onExit?.();
       }),
     );
-    this.generation = await invoke<number>("acp_start", { cwd, thinking: thinking || null });
+    if (this.disposed) {
+      this.unlisten.forEach((u) => u());
+      this.unlisten = [];
+      throw new Error("ACP client disposed");
+    }
+    this.procId = await invoke<number>("acp_start", { cwd, thinking: thinking || null });
+    if (this.disposed) {
+      invoke("acp_stop", { id: this.procId }).catch(() => {});
+      throw new Error("ACP client disposed");
+    }
     await this.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
     });
   }
 
-  dispose() {
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
     this.disposed = true;
     for (const p of this.pending.values()) p.reject(new Error("ACP client disposed"));
     this.pending.clear();
     this.unlisten.forEach((u) => u());
     this.unlisten = [];
+    if (this.procId < 0) return;
+    const id = this.procId;
+    let stop: UnlistenFn | undefined;
+    const exited = new Promise<void>((resolve) => {
+      listen<number>("acp://exit", (e) => e.payload === id && resolve()).then((u) => (stop = u));
+      setTimeout(resolve, 3500);
+    });
+    await invoke("acp_stop", { id }).catch(() => {});
+    await exited;
+    stop?.();
   }
 
   newSession(cwd: string): Promise<SessionInfo> {
@@ -123,7 +147,7 @@ export class AcpClient {
 
   private send(msg: object) {
     if (this.disposed) return Promise.reject(new Error("ACP client disposed"));
-    return invoke("acp_send", { line: JSON.stringify({ jsonrpc: "2.0", ...msg }) });
+    return invoke("acp_send", { id: this.procId, line: JSON.stringify({ jsonrpc: "2.0", ...msg }) });
   }
 
   request<T = any>(method: string, params: object): Promise<T> {

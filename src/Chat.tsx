@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ConfigOption, PermissionRequest, ToolCall } from "./acp";
+import * as monaco from "./monacoSlim";
+import type { ConfigOption, ToolCall } from "./acp";
 import { fileBadge } from "./FileTree";
+import { langFor } from "./monaco";
+import { lineDiff, stripFence, toolOps, ToolOp } from "./toolOps";
+import type { ChatState } from "./useChats";
 
 export type ChatItem =
   | { kind: "user"; text: string; context?: string[]; images?: string[] }
@@ -22,51 +26,255 @@ export interface ContextChip {
 }
 
 interface Props {
-  items: ChatItem[];
-  busy: boolean;
-  ready: boolean;
-  permission: PermissionRequest | null;
+  chat?: ChatState;
+  chats: ChatState[];
+  onSelectChat: (key: string) => void;
+  onNewChat: () => void;
+  onCloseChat: (key: string) => void;
   onPermission: (optionId: string | null) => void;
   onSend: (text: string, images: PastedImage[]) => void;
   onCancel: () => void;
-  onNewChat: () => void;
   onOpenPath: (path: string, line?: number) => void;
   context: ContextChip[];
   onRemoveContext: (i: number) => void;
   onAttachFile: (path: string) => void;
   workspaceFiles: string[];
   root: string;
-  model?: ConfigOption;
   onModel: (v: string) => void;
-  mode?: string;
-  modes: { id: string; name: string }[];
   onMode: (id: string) => void;
-  usage?: { used: number; size: number; cost?: { amount: number } };
-  effort: string;
   onEffort: (v: string) => void;
   focusKey: number;
 }
 
 const STATUS_ICON: Record<string, string> = { pending: "○", in_progress: "◐", completed: "✓", failed: "✕" };
 
-function CodeBlock({ lang, code }: { lang: string; code: string }) {
+const LANG_ALIAS: Record<string, string> = {
+  py: "python", python3: "python", ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
+  sh: "shell", bash: "shell", zsh: "shell", console: "shell", rs: "rust", yml: "yaml", md: "markdown",
+  html: "html", css: "css", json: "json", go: "go", rb: "ruby", kt: "kotlin", cs: "csharp", "c++": "cpp",
+};
+let themeReady = false;
+
+function normLang(lang: string, path?: string) {
+  if (path) return langFor(path);
+  const l = (lang || "").toLowerCase();
+  const id = LANG_ALIAS[l] ?? l;
+  return monaco.languages.getLanguages().some((x) => x.id === id) ? id : "plaintext";
+}
+
+function useColorized(code: string, language: string) {
+  const [lines, setLines] = useState<string[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    if (!themeReady) {
+      monaco.editor.setTheme("vs-dark");
+      themeReady = true;
+    }
+    if (language === "plaintext" || code.length > 60000) {
+      setLines(null);
+      return;
+    }
+    const t = setTimeout(() => {
+      monaco.editor
+        .colorize(code, language, { tabSize: 4 })
+        .then((html) => {
+          if (!alive) return;
+          const parts = html.replace(/<br\/>$/, "").split("<br/>");
+          setLines(parts.length === code.split("\n").length ? parts : null);
+        })
+        .catch(() => alive && setLines(null));
+    }, 60);
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+  }, [code, language]);
+  return lines;
+}
+
+function CodeLines({ code, language, kinds }: { code: string; language: string; kinds?: ("ctx" | "add" | "del")[] }) {
+  const html = useColorized(code, language);
+  const plain = code.split("\n");
+  return (
+    <pre className="code-lines">
+      {plain.map((text, i) => {
+        const k = kinds?.[i];
+        return (
+          <div key={i} className={"cl" + (k ? " cl-" + k : "")}>
+            {kinds && <span className="cl-sign">{k === "add" ? "+" : k === "del" ? "-" : " "}</span>}
+            {html ? <span dangerouslySetInnerHTML={{ __html: html[i] || "&nbsp;" }} /> : <span>{text || " "}</span>}
+          </div>
+        );
+      })}
+    </pre>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
-  const copy = () => {
-    navigator.clipboard.writeText(code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
+  return (
+    <button
+      className="copy-btn"
+      onClick={(e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+    >
+      {copied ? "Copied ✓" : "Copy"}
+    </button>
+  );
+}
+
+function CodeBlock({ lang, code }: { lang: string; code: string }) {
   return (
     <div className="md-code">
       <div className="md-code-head">
         <span>{lang || "code"}</span>
-        <button className="copy-btn" onClick={copy}>
-          {copied ? "Copied ✓" : "Copy"}
-        </button>
+        <CopyButton text={code} />
       </div>
-      <pre>
-        <code>{code}</code>
-      </pre>
+      <CodeLines code={code} language={normLang(lang)} />
+    </div>
+  );
+}
+
+function Collapsible({ lines, children, limit = 18 }: { lines: number; children: React.ReactNode; limit?: number }) {
+  const [full, setFull] = useState(false);
+  const clipped = lines > limit && !full;
+  return (
+    <div className={"collapsible" + (clipped ? " clipped" : "")} style={clipped ? { maxHeight: limit * 18 } : undefined}>
+      {children}
+      {lines > limit && (
+        <button className="show-more" onClick={() => setFull(!full)}>
+          {full ? "Show less" : `Show all ${lines} lines`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function FileChip({ path, onOpen }: { path: string; onOpen: (p: string) => void }) {
+  const name = path.split("/").pop() ?? path;
+  const badge = fileBadge(name);
+  return (
+    <span className="file-chip" title={path} onClick={() => onOpen(path)}>
+      <span className="file-badge" style={{ color: badge.color }}>{badge.label}</span>
+      {name}
+    </span>
+  );
+}
+
+function OpView({ op, onOpenPath }: { op: ToolOp; onOpenPath: (p: string, line?: number) => void }) {
+  if (op.type === "edit") {
+    const d = lineDiff(op.oldText, op.newText);
+    const add = d.filter((x) => x.t === "add").length;
+    const del = d.filter((x) => x.t === "del").length;
+    return (
+      <div className="op">
+        <div className="op-head">
+          <span className="op-verb">Edited</span>
+          <FileChip path={op.path} onOpen={onOpenPath} />
+          <span className="stat-add">+{add}</span>
+          <span className="stat-del">-{del}</span>
+        </div>
+        <Collapsible lines={d.length}>
+          <CodeLines code={d.map((x) => x.text).join("\n")} language={normLang("", op.path)} kinds={d.map((x) => x.t)} />
+        </Collapsible>
+      </div>
+    );
+  }
+  if (op.type === "write") {
+    const n = op.content.replace(/\n$/, "").split("\n").length;
+    return (
+      <div className="op">
+        <div className="op-head">
+          <span className="op-verb">Wrote</span>
+          <FileChip path={op.path} onOpen={onOpenPath} />
+          <span className="stat-add">+{n}</span>
+          <CopyButton text={op.content} />
+        </div>
+        <Collapsible lines={n}>
+          <CodeLines
+            code={op.content.replace(/\n$/, "")}
+            language={normLang("", op.path)}
+            kinds={Array(n).fill("add")}
+          />
+        </Collapsible>
+      </div>
+    );
+  }
+  if (op.type === "bash") {
+    return (
+      <div className="op">
+        <div className="op-cmd">
+          <span className="prompt">$</span>
+          <code>{op.command}</code>
+        </div>
+      </div>
+    );
+  }
+  if (op.type === "read") {
+    return (
+      <div className="op op-inline">
+        <span className="op-verb">Read</span>
+        <FileChip path={op.path} onOpen={(p) => onOpenPath(p, op.line)} />
+      </div>
+    );
+  }
+  return null;
+}
+
+function ToolCard({ call, onOpenPath }: { call: ToolCall; onOpenPath: (p: string, line?: number) => void }) {
+  const ops = useMemo(() => toolOps(call.toolName, call.rawInput), [call.toolName, call.rawInput]);
+  const output = stripFence(
+    (call.content ?? [])
+      .map((c: any) => (c.type === "content" ? c.content?.text ?? "" : ""))
+      .filter(Boolean)
+      .join("\n"),
+  ).trim();
+  const hasCode = ops.some((o) => o.type === "edit" || o.type === "write" || o.type === "bash");
+  const onlyReads = ops.length > 0 && ops.every((o) => o.type === "read");
+  const isBash = ops.some((o) => o.type === "bash");
+  const [showOut, setShowOut] = useState(false);
+  const status = call.status ?? "pending";
+  const name = call.toolName ?? call.kind ?? "tool";
+  const title = call.title && call.title !== name ? call.title : "";
+
+  if (onlyReads) {
+    return (
+      <div className={"tool tool-compact " + status}>
+        <span className={"tool-status-icon " + status}>{STATUS_ICON[status]}</span>
+        {ops.map((o, i) => <OpView key={i} op={o} onOpenPath={onOpenPath} />)}
+      </div>
+    );
+  }
+
+  return (
+    <div className={"tool " + status}>
+      <div className="tool-head" onClick={() => output && setShowOut(!showOut)}>
+        <span className={"tool-status-icon " + status}>{STATUS_ICON[status]}</span>
+        <span className="tool-kind">{name}</span>
+        {title && <span className="tool-title" title={call.title}>{title}</span>}
+        {output && <span className="tool-expand">{showOut ? "▾ output" : "▸ output"}</span>}
+      </div>
+      {hasCode && (
+        <div className="ops">
+          {ops.map((o, i) => <OpView key={i} op={o} onOpenPath={onOpenPath} />)}
+        </div>
+      )}
+      {!hasCode && call.locations && call.locations.length > 0 && (
+        <div className="tool-locs">
+          {call.locations.map((l, idx) => (
+            <FileChip key={l.path + idx} path={l.path} onOpen={(p) => onOpenPath(p, l.line)} />
+          ))}
+        </div>
+      )}
+      {output && (showOut || (isBash && status === "failed")) && (
+        <Collapsible lines={output.split("\n").length}>
+          <pre className="tool-out">{output}</pre>
+        </Collapsible>
+      )}
     </div>
   );
 }
@@ -151,56 +359,51 @@ function MarkdownView({ text }: { text: string }) {
   );
 }
 
-function ToolCard({
-  call,
-  onOpenPath,
-  onReviewDiff,
+function ChatTabs({
+  chats,
+  activeKey,
+  onSelect,
+  onNew,
+  onClose,
 }: {
-  call: ToolCall;
-  onOpenPath: (p: string, line?: number) => void;
-  onReviewDiff?: (p: string) => void;
+  chats: ChatState[];
+  activeKey?: string;
+  onSelect: (k: string) => void;
+  onNew: () => void;
+  onClose: (k: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const text = (call.content ?? [])
-    .map((c: any) => (c.type === "content" ? c.content?.text : c.type === "diff" ? `diff ${c.path}` : ""))
-    .filter(Boolean)
-    .join("\n")
-    .replace(/^```\n?|\n?```$/g, "");
-
-  const status = call.status ?? "pending";
   return (
-    <div className={"tool " + status}>
-      <div className="tool-head" onClick={() => text && setOpen(!open)}>
-        <span className={"tool-status-icon " + status}>{STATUS_ICON[status]}</span>
-        <span className="tool-kind">{call.kind ?? "tool"}</span>
-        <span className="tool-title" title={call.title}>
-          {call.title}
-        </span>
-        {text && <span className="tool-expand">{open ? "▾" : "▸"}</span>}
-      </div>
-      {call.locations && call.locations.length > 0 && (
-        <div className="tool-locs">
-          {call.locations.map((l, idx) => {
-            const name = l.path.split("/").pop() ?? l.path;
-            const badge = fileBadge(name);
-            return (
-              <span
-                key={l.path + idx}
-                className="tool-loc"
-                title={l.path}
-                onClick={() => (onReviewDiff && call.kind === "edit" ? onReviewDiff(l.path) : onOpenPath(l.path, l.line))}
-              >
-                <span style={{ color: badge.color, fontSize: 10 }}>{badge.label}</span>
-                <span>
-                  {l.path.split("/").slice(-2).join("/")}
-                  {l.line ? `:${l.line}` : ""}
-                </span>
-              </span>
-            );
-          })}
+    <div className="chat-tabs">
+      {chats.map((c) => (
+        <div
+          key={c.key}
+          className={"chat-tab" + (c.key === activeKey ? " active" : "")}
+          title={c.title}
+          onClick={() => onSelect(c.key)}
+          onAuxClick={(e) => e.button === 1 && onClose(c.key)}
+        >
+          {c.busy || c.restoring ? (
+            <span className="spinner sm" />
+          ) : c.permission ? (
+            <span className="chat-tab-dot warn" />
+          ) : c.unread ? (
+            <span className="chat-tab-dot" />
+          ) : null}
+          <span className="chat-tab-title">{c.title}</span>
+          <span
+            className="chat-tab-close"
+            onClick={(e) => {
+              e.stopPropagation();
+              onClose(c.key);
+            }}
+          >
+            ×
+          </span>
         </div>
-      )}
-      {open && text && <pre className="tool-out">{text}</pre>}
+      ))}
+      <button className="icon-btn chat-tab-new" title="New chat (runs in parallel)" onClick={onNew}>
+        ＋
+      </button>
     </div>
   );
 }
@@ -342,7 +545,20 @@ function ModelPicker({ model, disabled, onPick }: { model: ConfigOption; disable
   );
 }
 
-export default function Chat(p: Props) {
+export default function Chat(props: Props) {
+  const ch = props.chat;
+  const p = {
+    ...props,
+    items: ch?.items ?? [],
+    busy: !!ch?.busy,
+    ready: !!ch?.ready,
+    permission: ch?.permission ?? null,
+    model: ch?.model,
+    mode: ch?.mode,
+    modes: ch?.modes ?? [],
+    usage: ch?.usage,
+    effort: ch?.effort ?? "",
+  };
   const [input, setInput] = useState("");
   const [images, setImages] = useState<PastedImage[]>([]);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -385,6 +601,14 @@ export default function Chat(p: Props) {
   useEffect(() => {
     if (p.focusKey > 0) taRef.current?.focus();
   }, [p.focusKey]);
+
+  useEffect(() => {
+    setStickToBottom(true);
+    requestAnimationFrame(() => {
+      if (msgsRef.current) msgsRef.current.scrollTop = msgsRef.current.scrollHeight;
+    });
+    taRef.current?.focus();
+  }, [ch?.key]);
 
   const handleInputChange = (val: string, cursor?: number) => {
     setInput(val);
@@ -437,6 +661,13 @@ export default function Chat(p: Props) {
 
   return (
     <div className="chat">
+      <ChatTabs
+        chats={p.chats}
+        activeKey={ch?.key}
+        onSelect={p.onSelectChat}
+        onNew={p.onNewChat}
+        onClose={p.onCloseChat}
+      />
       <div className="pane-title chat-head">
         <span className="chat-brand">
           <span className={"status-dot " + (p.ready ? (p.busy ? "busy" : "ready") : "offline")} />
@@ -465,9 +696,6 @@ export default function Chat(p: Props) {
             {modelVariants.is1M ? "1M" : "200K"}
           </button>
         )}
-        <button className="icon-btn" title="New Chat Session" onClick={p.onNewChat} disabled={!p.ready || p.busy}>
-          ＋
-        </button>
       </div>
 
       <div
@@ -479,7 +707,12 @@ export default function Chat(p: Props) {
           setStickToBottom(nearBottom);
         }}
       >
-        {p.items.length === 0 && (
+        {p.items.length === 0 && ch?.restoring && (
+          <div className="chat-empty">
+            <span className="spinner" /> {ch.sessionId ? "Restoring chat…" : "Starting maki…"}
+          </div>
+        )}
+        {p.items.length === 0 && !ch?.restoring && (
           <div className="chat-empty">
             <div className="chat-empty-title">Ask maki anything</div>
             <div className="chat-empty-tips">
@@ -487,6 +720,7 @@ export default function Chat(p: Props) {
               <div><kbd>⌘K</kbd> Inline edit selected lines</div>
               <div><kbd>⌘P</kbd> Quick open file</div>
               <div><kbd>@</kbd> Mention a file · <kbd>⌘V</kbd> Paste screenshot</div>
+              <div><kbd>＋</kbd> New chat, chats run in parallel</div>
             </div>
           </div>
         )}

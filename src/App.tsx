@@ -1,11 +1,13 @@
 import "./monaco";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Editor, { DiffEditor, OnMount } from "@monaco-editor/react";
-import * as monaco from "monaco-editor";
+import * as monaco from "./monacoSlim";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { AcpClient, ConfigOption, ContentBlock, PermissionRequest, SessionUpdate, ToolCall } from "./acp";
-import Chat, { ChatItem, ContextChip, PastedImage } from "./Chat";
+import { ContentBlock, ToolCall } from "./acp";
+import { useChats } from "./useChats";
+import { editedPaths, toolOps } from "./toolOps";
+import Chat, { ContextChip, PastedImage } from "./Chat";
 import FileTree, { fileBadge } from "./FileTree";
 import TerminalPanel, { TermSession } from "./TerminalPanel";
 import { langFor } from "./monaco";
@@ -49,27 +51,13 @@ export default function App() {
   const [quickIdx, setQuickIdx] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
 
-  const [items, setItems] = useState<ChatItem[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [sessionId, setSessionId] = useState<string>();
-  const [permission, setPermission] = useState<PermissionRequest | null>(null);
-  const [model, setModel] = useState<ConfigOption>();
-  const [modes, setModes] = useState<{ id: string; name: string }[]>([]);
-  const [mode, setMode] = useState<string>();
-  const [usage, setUsage] = useState<any>();
   const [context, setContext] = useState<ContextChip[]>([]);
   const [chatFocus, setChatFocus] = useState(0);
-  const [effort, setEffort] = useState(() => localStorage.getItem("mormaki_effort") ?? "");
-  const resumeRef = useRef<{ root: string; sessionId: string } | null>(null);
-  const sessionIdRef = useRef<string | undefined>(undefined);
 
   const [changes, setChanges] = useState<Record<string, Change>>({});
   const [review, setReview] = useState<{ path: string; before: string; after: string } | null>(null);
   const [inline, setInline] = useState<{ path: string; startLine: number; endLine: number; text: string } | null>(null);
 
-  const acpRef = useRef<AcpClient>(undefined);
-  const permResolve = useRef<(id: string | null) => void>(undefined);
-  const toolKinds = useRef<Record<string, string | undefined>>({});
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
   const changesRef = useRef(changes);
@@ -83,15 +71,7 @@ export default function App() {
     setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 3200);
   }, []);
 
-  const push = useCallback((item: ChatItem) => setItems((xs) => [...xs, item]), []);
 
-  const appendText = useCallback((kind: "agent" | "thought" | "user", text: string) => {
-    setItems((xs) => {
-      const last = xs[xs.length - 1];
-      if (last?.kind === kind) return [...xs.slice(0, -1), { kind, text: last.text + text }];
-      return [...xs, { kind, text }];
-    });
-  }, []);
 
   const openTerminalInDir = useCallback(
     (dir?: string) => {
@@ -167,159 +147,37 @@ export default function App() {
     setTabs((ts) => ts.map((t) => (t.path === path && t.value === t.saved ? { ...t, saved: content, value: content } : t)));
   }, []);
 
-  const upsertTool = useCallback((u: ToolCall) => {
-    setItems((xs) => {
-      const i = xs.findIndex((x) => x.kind === "tool" && x.call.toolCallId === u.toolCallId);
-      if (i < 0) return [...xs, { kind: "tool", call: u }];
-      const prev = (xs[i] as { kind: "tool"; call: ToolCall }).call;
-      const next = [...xs];
-      next[i] = {
-        kind: "tool",
-        call: { ...prev, ...Object.fromEntries(Object.entries(u).filter(([, v]) => v !== undefined)) },
-      };
-      return next;
-    });
-  }, []);
-
-  const onUpdate = useCallback(
-    (u: SessionUpdate) => {
-      switch (u.sessionUpdate) {
-        case "user_message_chunk":
-          if (u.content?.type === "text") appendText("user", u.content.text);
-          break;
-        case "agent_message_chunk":
-          if (u.content?.type === "text") appendText("agent", u.content.text);
-          break;
-        case "agent_thought_chunk":
-          if (u.content?.type === "text") appendText("thought", u.content.text);
-          break;
-        case "tool_call":
-        case "tool_call_update": {
-          const call = u as unknown as ToolCall;
-          if (call.kind) toolKinds.current[call.toolCallId] = call.kind;
-          upsertTool(call);
-          const isEdit = toolKinds.current[call.toolCallId] === "edit";
-          for (const c of call.content ?? []) {
-            if (c.type === "diff") snapshot(c.path as string, (c.oldText as string | null) ?? null);
-          }
-          if (isEdit && call.status !== "completed" && call.status !== "failed") {
-            call.locations?.forEach((l) => snapshot(l.path));
-          }
-          if (call.status === "completed") {
-            setTreeRefresh((n) => n + 1);
-            call.locations?.forEach((l) => reloadFromDisk(l.path));
-            tabsRef.current.forEach((t) => reloadFromDisk(t.path));
-          }
-          break;
-        }
-        case "plan":
-          setItems((xs) => {
-            const rest = xs.filter((x) => x.kind !== "plan");
-            return [...rest, { kind: "plan", entries: u.entries }];
-          });
-          break;
-        case "usage_update":
-          setUsage(u);
-          break;
-        case "current_mode_update":
-          setMode(u.currentModeId);
-          break;
-        case "config_option_update":
-          setModel(u.configOptions?.find((o: ConfigOption) => o.id === "model"));
-          break;
+  const onToolCall = useCallback(
+    (call: ToolCall, replaying: boolean) => {
+      if (replaying) return;
+      const ops = toolOps(call.toolName, call.rawInput);
+      for (const c of call.content ?? []) {
+        if (c.type === "diff") snapshot(c.path as string, (c.oldText as string | null) ?? null);
+      }
+      if (call.status !== "completed" && call.status !== "failed") {
+        editedPaths(ops).forEach((p) => snapshot(p));
+        if (call.kind === "edit") call.locations?.forEach((l) => snapshot(l.path));
+      }
+      if (call.status === "completed") {
+        setTreeRefresh((n) => n + 1);
+        editedPaths(ops).forEach((p) => reloadFromDisk(p));
+        tabsRef.current.forEach((t) => reloadFromDisk(t.path));
       }
     },
-    [appendText, upsertTool, snapshot, reloadFromDisk],
+    [snapshot, reloadFromDisk],
   );
+
+  const chatApi = useChats(root, { onToolCall });
+  const activeChat = chatApi.active;
 
   useEffect(() => {
     if (!root) return;
-    let cancelled = false;
-    const client = new AcpClient({
-      onUpdate,
-      onPermission: (req) =>
-        new Promise((resolve) => {
-          setPermission(req);
-          permResolve.current = resolve;
-        }),
-      onStderr: (line) => console.debug("[maki]", line),
-      onExit: () => !cancelled && push({ kind: "error", text: "maki acp exited" }),
+    invoke("list_dir", { path: root }).catch(() => {
+      localStorage.removeItem("workspace");
+      setRoot(null);
+      showToast("Workspace folder no longer exists");
     });
-    acpRef.current = client;
-    const resume = resumeRef.current?.root === root ? resumeRef.current.sessionId : undefined;
-    resumeRef.current = null;
-    setItems([]);
-    setSessionId(undefined);
-    (async () => {
-      try {
-        await client.start(root, effort);
-        let s: { sessionId?: string; modes?: any; configOptions?: ConfigOption[] } | null = null;
-        if (resume) {
-          try {
-            s = (await client.loadSession(resume, root)) ?? {};
-            s.sessionId = resume;
-          } catch (e) {
-            if (!cancelled) push({ kind: "error", text: `Could not resume chat, started a new one: ${String(e)}` });
-          }
-        }
-        if (!s) s = await client.newSession(root);
-        if (cancelled) return;
-        setSessionId(s.sessionId);
-        if (s.modes) {
-          setModes(s.modes.availableModes ?? []);
-          setMode(s.modes.currentModeId);
-        }
-        const m = s.configOptions?.find((o) => o.id === "model");
-        if (m) setModel(m);
-      } catch (e) {
-        if (!cancelled) {
-          const msg = String(e);
-          if (msg.includes("workspace directory does not exist")) {
-            localStorage.removeItem("workspace");
-            setRoot(null);
-            showToast("Workspace folder no longer exists");
-          } else {
-            push({ kind: "error", text: msg });
-          }
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-      client.dispose();
-    };
-  }, [root, effort, onUpdate, push, showToast]);
-
-  sessionIdRef.current = sessionId;
-  const changeEffort = useCallback(
-    (next: string) => {
-      if (next === effort || busy) return;
-      if (root && sessionIdRef.current) resumeRef.current = { root, sessionId: sessionIdRef.current };
-      localStorage.setItem("mormaki_effort", next);
-      setEffort(next);
-    },
-    [effort, busy, root],
-  );
-
-  const startNewChat = useCallback(async () => {
-    const client = acpRef.current;
-    if (!client || !root || busy) return;
-    try {
-      const s = await client.newSession(root);
-      setSessionId(s.sessionId);
-      setItems([]);
-      setUsage(undefined);
-      setContext([]);
-      if (s.modes) {
-        setModes(s.modes.availableModes ?? []);
-        setMode(s.modes.currentModeId);
-      }
-      const m = s.configOptions?.find((o) => o.id === "model");
-      if (m) setModel(m);
-    } catch (e) {
-      push({ kind: "error", text: String(e) });
-    }
-  }, [root, busy, push]);
+  }, [root, showToast]);
 
   const revealLine = useCallback((line?: number) => {
     if (!line || !editorRef.current) return;
@@ -401,8 +259,12 @@ export default function App() {
 
   const send = useCallback(
     async (text: string, extra: ContextChip[] = context, images: PastedImage[] = []) => {
-      const client = acpRef.current;
-      if (!client || !sessionId || !root) return;
+      const chat = chatApi.active;
+      if (!chat || !root) return;
+      if (chat.busy || !chat.ready) {
+        showToast(chat.busy ? "This chat is busy. Open a new chat (＋) to run in parallel." : "maki is still starting…");
+        return;
+      }
       const blocks: ContentBlock[] = [
         ...extra.map((c) => ({
           type: "resource" as const,
@@ -411,39 +273,16 @@ export default function App() {
         ...images.map((im) => ({ type: "image" as const, mimeType: im.mimeType, data: im.data })),
         { type: "text" as const, text },
       ];
-      push({
+      setContext([]);
+      await chatApi.send(chat.key, blocks, {
         kind: "user",
         text,
         context: extra.map((c) => c.label),
         images: images.map((im) => `data:${im.mimeType};base64,${im.data}`),
       });
-      setContext([]);
-      setBusy(true);
-      try {
-        const r = await client.prompt(sessionId, blocks);
-        if (r.stopReason && r.stopReason !== "end_turn" && r.stopReason !== "cancelled") {
-          push({ kind: "error", text: `stopped: ${r.stopReason}` });
-        }
-      } catch (e) {
-        push({ kind: "error", text: String(e) });
-      } finally {
-        setBusy(false);
-        setPermission(null);
-      }
     },
-    [context, sessionId, root, push],
+    [context, root, chatApi, showToast],
   );
-
-  const cancel = () => {
-    if (sessionId) acpRef.current?.cancel(sessionId);
-    permResolve.current?.(null);
-    setPermission(null);
-  };
-
-  const answerPermission = (id: string | null) => {
-    permResolve.current?.(id);
-    setPermission(null);
-  };
 
   const addSelectionToChat = useCallback(() => {
     const ed = editorRef.current;
@@ -870,40 +709,27 @@ export default function App() {
       <div className="sash" onMouseDown={(e) => startResize("right", e.clientX)} />
 
       <Chat
-        items={items}
-        busy={busy}
-        ready={!!sessionId}
-        permission={permission}
-        onPermission={answerPermission}
+        chat={activeChat}
+        chats={chatApi.chats}
+        onSelectChat={chatApi.setActiveKey}
+        onNewChat={chatApi.newChat}
+        onCloseChat={(k) => {
+          const c = chatApi.chats.find((x) => x.key === k);
+          if (c?.busy && !window.confirm("This chat is still working. Stop it and close?")) return;
+          chatApi.closeChat(k);
+        }}
+        onPermission={(id) => activeChat && chatApi.answerPermission(activeChat.key, id)}
         onSend={(t, imgs) => send(t, context, imgs)}
-        onCancel={cancel}
-        onNewChat={startNewChat}
+        onCancel={() => activeChat && chatApi.cancel(activeChat.key)}
         onOpenPath={openFile}
         context={context}
         onRemoveContext={(i) => setContext((c) => c.filter((_, j) => j !== i))}
         onAttachFile={attachFileToContext}
         workspaceFiles={workspaceFiles}
         root={root}
-        model={model}
-        onModel={(v) =>
-          sessionId &&
-          acpRef.current?.setConfigOption(sessionId, "model", v).then(
-            (r: any) => setModel(r?.configOptions?.find((o: ConfigOption) => o.id === "model") ?? { ...model!, currentValue: v }),
-            (e) => push({ kind: "error", text: String(e) }),
-          )
-        }
-        mode={mode}
-        modes={modes}
-        onMode={(id) =>
-          sessionId &&
-          acpRef.current?.setMode(sessionId, id).then(
-            () => setMode(id),
-            (e) => push({ kind: "error", text: String(e) }),
-          )
-        }
-        usage={usage}
-        effort={effort}
-        onEffort={changeEffort}
+        onModel={(v) => activeChat && chatApi.setModel(activeChat.key, v)}
+        onMode={(id) => activeChat && chatApi.setMode(activeChat.key, id)}
+        onEffort={(v) => activeChat && chatApi.setEffort(activeChat.key, v)}
         focusKey={chatFocus}
       />
 

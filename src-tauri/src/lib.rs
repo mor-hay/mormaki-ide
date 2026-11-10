@@ -7,11 +7,15 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
 
+struct AcpProc {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
 #[derive(Default)]
 struct Acp {
-    generation: u64,
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    next_id: u64,
+    procs: HashMap<u64, AcpProc>,
 }
 
 type AcpState = Mutex<Acp>;
@@ -57,6 +61,27 @@ fn find_maki() -> PathBuf {
         .unwrap_or_else(|| "maki".into())
 }
 
+#[derive(Serialize, Clone)]
+struct AcpLine {
+    id: u64,
+    line: String,
+}
+
+fn stop_gracefully(mut child: Child, stdin: Option<ChildStdin>) {
+    drop(stdin);
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+}
+
 #[tauri::command]
 fn acp_start(
     app: AppHandle,
@@ -66,19 +91,6 @@ fn acp_start(
 ) -> Result<u64, String> {
     if !Path::new(&cwd).is_dir() {
         return Err(format!("workspace directory does not exist: {cwd}"));
-    }
-    let mut acp = state.lock().unwrap();
-    acp.stdin.take();
-    if let Some(mut old) = acp.child.take() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            if let Ok(Some(_)) = old.try_wait() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let _ = old.kill();
-        let _ = old.wait();
     }
     let mut cmd = Command::new(find_maki());
     cmd.arg("acp").current_dir(&cwd);
@@ -99,37 +111,48 @@ fn acp_start(
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    acp.stdin = child.stdin.take();
-    acp.child = Some(child);
-    acp.generation += 1;
-    let generation = acp.generation;
+    let stdin = child.stdin.take();
+
+    let mut acp = state.lock().unwrap();
+    acp.next_id += 1;
+    let id = acp.next_id;
+    acp.procs.insert(id, AcpProc { child, stdin });
+    drop(acp);
 
     let out_app = app.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let _ = out_app.emit("acp://message", line);
+            let _ = out_app.emit("acp://message", AcpLine { id, line });
         }
-        eprintln!("[maki acp #{generation}] stdout closed");
-        let _ = out_app.emit("acp://exit", generation);
+        eprintln!("[maki acp #{id}] stdout closed");
+        let _ = out_app.emit("acp://exit", id);
     });
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            eprintln!("[maki acp #{generation}] {line}");
-            let _ = app.emit("acp://stderr", line);
+            eprintln!("[maki acp #{id}] {line}");
+            let _ = app.emit("acp://stderr", AcpLine { id, line });
         }
     });
-    Ok(generation)
+    Ok(id)
 }
 
 #[tauri::command]
-fn acp_send(state: State<AcpState>, line: String) -> Result<(), String> {
+fn acp_send(state: State<AcpState>, id: u64, line: String) -> Result<(), String> {
     let mut acp = state.lock().unwrap();
-    let stdin = acp.stdin.as_mut().ok_or("maki acp is not running")?;
+    let proc_ = acp.procs.get_mut(&id).ok_or("maki acp is not running")?;
+    let stdin = proc_.stdin.as_mut().ok_or("maki acp is not running")?;
     stdin
         .write_all(line.as_bytes())
         .and_then(|_| stdin.write_all(b"\n"))
         .and_then(|_| stdin.flush())
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn acp_stop(state: State<AcpState>, id: u64) {
+    if let Some(p) = state.lock().unwrap().procs.remove(&id) {
+        stop_gracefully(p.child, p.stdin);
+    }
 }
 
 #[tauri::command]
@@ -368,6 +391,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             acp_start,
             acp_send,
+            acp_stop,
             pty_spawn,
             pty_write,
             pty_resize,
@@ -386,8 +410,21 @@ pub fn run() {
                 use tauri::Manager;
                 let state = app.state::<AcpState>();
                 let mut acp = state.lock().unwrap();
-                acp.stdin.take();
-                if let Some(mut c) = acp.child.take() {
+                let mut children: Vec<Child> = acp
+                    .procs
+                    .drain()
+                    .map(|(_, mut p)| {
+                        p.stdin.take();
+                        p.child
+                    })
+                    .collect();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline
+                    && children.iter_mut().any(|c| !matches!(c.try_wait(), Ok(Some(_))))
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                for c in children.iter_mut() {
                     let _ = c.kill();
                     let _ = c.wait();
                 }
