@@ -50,6 +50,13 @@ export interface SessionInfo {
   configOptions?: ConfigOption[];
 }
 
+export interface SessionSummary {
+  sessionId: string;
+  cwd: string;
+  title?: string;
+  updatedAt?: string;
+}
+
 export type SessionUpdate = { sessionUpdate: string; [k: string]: any };
 
 export interface AcpHandlers {
@@ -71,7 +78,7 @@ export class AcpClient {
 
   constructor(private handlers: AcpHandlers) {}
 
-  async start(cwd: string, thinking?: string) {
+  async start(cwd: string, thinking?: string, yolo?: boolean) {
     this.unlisten.push(
       await listen<ProcLine>("acp://message", (e) => {
         if (!this.disposed && e.payload.id === this.procId) this.onLine(e.payload.line);
@@ -91,7 +98,7 @@ export class AcpClient {
       this.unlisten = [];
       throw new Error("ACP client disposed");
     }
-    this.procId = await invoke<number>("acp_start", { cwd, thinking: thinking || null });
+    this.procId = await invoke<number>("acp_start", { cwd, thinking: thinking || null, yolo: !!yolo });
     if (this.disposed) {
       invoke("acp_stop", { id: this.procId }).catch(() => {});
       throw new Error("ACP client disposed");
@@ -123,6 +130,10 @@ export class AcpClient {
 
   newSession(cwd: string): Promise<SessionInfo> {
     return this.request("session/new", { cwd, mcpServers: [] });
+  }
+
+  listSessions(cwd: string): Promise<{ sessions: SessionSummary[] }> {
+    return this.request("session/list", { cwd });
   }
 
   loadSession(sessionId: string, cwd: string): Promise<SessionInfo | null> {

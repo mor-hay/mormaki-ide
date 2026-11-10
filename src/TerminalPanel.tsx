@@ -68,6 +68,9 @@ function TermInstance({
 
     termRef.current = term;
     fitRef.current = fit;
+    const w = window as any;
+    (w.__mormaki ??= {}).terms ??= {};
+    w.__mormaki.terms[session.key] = term;
 
     let disposed = false;
     let unlistenData: (() => void) | undefined;
@@ -125,6 +128,7 @@ function TermInstance({
       if (ptyIdRef.current !== undefined) {
         invoke("pty_kill", { id: ptyIdRef.current }).catch(() => {});
       }
+      delete (window as any).__mormaki?.terms?.[session.key];
       term.dispose();
     };
   }, [session.key]);
@@ -155,11 +159,13 @@ export default function TerminalPanel(p: Props) {
   return (
     <div className="term-panel" style={{ display: p.visible ? "flex" : "none" }}>
       <div className="term-bar">
-        <span className="term-bar-label">TERMINAL</span>
+        <span className="term-bar-label" data-testid="term-label">TERMINAL</span>
         <div className="term-tabs">
           {p.sessions.map((s, idx) => (
             <div
               key={s.key}
+              data-testid="term-tab"
+              data-key={s.key}
               className={"term-tab" + (s.key === p.activeKey ? " active" : "")}
               title={s.cwd}
               onClick={() => p.onSelect(s.key)}
@@ -179,7 +185,7 @@ export default function TerminalPanel(p: Props) {
               </span>
             </div>
           ))}
-          <button className="icon-btn" title="New Terminal (+)" onClick={p.onNew}>
+          <button className="icon-btn" title="New Terminal (+)" data-testid="term-new" onClick={p.onNew}>
             ＋
           </button>
         </div>

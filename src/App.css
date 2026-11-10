@@ -74,8 +74,9 @@ kbd {
 .welcome-card h1 { margin: 0 0 6px; font-size: 24px; letter-spacing: -0.02em; }
 .welcome-card p { margin: 0 0 20px; color: var(--dim); }
 
+.app-root { display: flex; flex-direction: column; height: 100vh; width: 100vw; overflow: hidden; }
 .layout {
-  display: grid; grid-template-rows: 100%; height: 100vh; width: 100vw; overflow: hidden;
+  display: grid; grid-template-rows: 100%; flex: 1; min-height: 0; width: 100vw; overflow: hidden;
 }
 .layout > * { min-width: 0; min-height: 0; overflow: hidden; }
 
@@ -580,3 +581,96 @@ kbd {
   font-size: 11px; padding: 2px 10px; border-radius: 10px; background: var(--bg3);
 }
 .collapsible:not(.clipped) .show-more { position: static; transform: none; display: block; margin: 4px auto 6px; }
+
+.statusbar {
+  height: 24px; flex-shrink: 0; display: flex; align-items: center; gap: 2px; padding: 0 8px;
+  background: #0e0e11; border-top: 1px solid var(--border); font-size: 11px; color: var(--dim);
+}
+.sb-item { display: inline-flex; align-items: center; gap: 5px; padding: 0 7px; height: 100%; cursor: default; white-space: nowrap; }
+.sb-item[title] { cursor: pointer; }
+.sb-item[title]:hover { background: var(--bg3); color: var(--fg); }
+.sb-accent { color: #93c5fd; }
+.sb-spacer { flex: 1; }
+
+.activity { display: flex; gap: 2px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.activity-btn {
+  flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  background: transparent; border: 1px solid transparent; color: var(--dim); font-size: 11.5px; padding: 3px 4px;
+}
+.activity-btn.active { background: var(--bg3); border-color: var(--border); color: #fff; }
+.side-view { flex: 1; min-height: 0; flex-direction: column; display: flex; }
+.side-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.side-empty { padding: 14px 12px; color: var(--dim); font-size: 12px; }
+.count-pill {
+  background: #2f2f36; color: var(--fg); border-radius: 8px; padding: 0 6px; font-size: 10px; line-height: 15px; flex-shrink: 0;
+}
+.icon-btn.on { color: #93c5fd; background: var(--accent-soft); }
+
+.search-box { display: flex; gap: 4px; padding: 8px 8px 4px; }
+.search-box input, .git-commit textarea, .dialog input {
+  flex: 1; min-width: 0; background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 5px; padding: 5px 8px; font: inherit; font-size: 12px; outline: none; user-select: text;
+}
+.search-box input:focus, .git-commit textarea:focus, .dialog input:focus { border-color: var(--accent); }
+.search-summary { padding: 2px 10px 6px; font-size: 11px; color: var(--dim); }
+.search-results, .git-lists { flex: 1; overflow-y: auto; overflow-x: hidden; padding-bottom: 8px; }
+.search-file, .git-row, .git-section {
+  display: flex; align-items: center; gap: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.search-file { font-weight: 500; }
+.search-file:hover, .search-hit:hover, .git-row:hover { background: var(--bg3); }
+.search-file-name, .git-name { overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; max-width: 60%; }
+.search-file-dir, .git-dir { color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+.search-hit { display: flex; gap: 8px; padding: 2px 8px 2px 30px; font-size: 11.5px; cursor: pointer; white-space: nowrap; }
+.search-line { color: var(--dim); font-family: monospace; min-width: 24px; text-align: right; flex-shrink: 0; }
+.search-text { overflow: hidden; text-overflow: ellipsis; font-family: "SF Mono", Menlo, monospace; }
+.search-text mark { background: rgba(234, 179, 8, 0.35); color: #fff; border-radius: 2px; }
+
+.branch-pill { font-size: 10.5px; color: #93c5fd; text-transform: none; letter-spacing: 0; margin-right: 4px; }
+.git-commit { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border); }
+.git-commit textarea { resize: vertical; flex: none; }
+.git-section {
+  cursor: default; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--dim); padding-top: 8px;
+}
+.git-section > span:first-child { flex: 1; }
+.git-actions { display: none; flex-shrink: 0; }
+.git-row:hover .git-actions { display: inline-flex; }
+.git-code { font-family: monospace; font-weight: 700; font-size: 11px; width: 12px; text-align: center; flex-shrink: 0; }
+.git-M { color: #eab308; } .git-A { color: #4ade80; } .git-U { color: #4ade80; } .git-D { color: #f87171; } .git-R { color: #60a5fa; }
+
+.ctx-sep { height: 1px; background: var(--border); margin: 3px 0; }
+.ctx-danger:hover { background: rgba(239, 68, 68, 0.18); }
+
+.dialog {
+  width: min(420px, 90vw); background: var(--bg3); border: 1px solid #3f3f46; border-radius: 10px;
+  padding: 16px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7); display: flex; flex-direction: column; gap: 10px;
+}
+.dialog-title { font-size: 13.5px; font-weight: 600; color: #fff; overflow-wrap: anywhere; }
+.dialog-msg { font-size: 12px; color: var(--dim); }
+.dialog input { flex: none; padding: 7px 9px; font-size: 13px; }
+.dialog-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+.recents { margin-top: 20px; text-align: left; max-width: 420px; }
+.recents-title { font-size: 11px; text-transform: uppercase; color: var(--dim); margin-bottom: 6px; }
+.recent-item { display: flex; gap: 10px; align-items: baseline; padding: 5px 8px; border-radius: 5px; cursor: pointer; }
+.recent-item:hover { background: var(--bg3); }
+.recent-path { color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.md-code-actions { display: inline-flex; gap: 2px; }
+.yolo-btn.active { background: rgba(234, 179, 8, 0.16); color: #fde047; border-color: rgba(234, 179, 8, 0.5); }
+.history-pop { width: 320px; }
+.history-item { justify-content: space-between; }
+.history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-item .effort-hint { flex-shrink: 0; }
+.composer-right { display: flex; gap: 6px; }
+.queued { display: flex; flex-direction: column; gap: 3px; margin-bottom: 6px; }
+.queued-item {
+  display: flex; align-items: center; gap: 6px; font-size: 11.5px; padding: 3px 8px;
+  background: var(--bg3); border: 1px dashed #3f3f46; border-radius: 5px;
+}
+.queued-label { color: var(--warn); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.queued-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queued-x { cursor: pointer; color: var(--dim); padding: 0 3px; }
+.perm-detail { margin-bottom: 8px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.perm-detail:empty { display: none; }

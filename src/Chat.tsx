@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import * as monaco from "./monacoSlim";
-import type { ConfigOption, ToolCall } from "./acp";
+import type { ConfigOption, SessionSummary, ToolCall } from "./acp";
 import { fileBadge } from "./FileTree";
 import { langFor } from "./monaco";
 import { lineDiff, stripFence, toolOps, ToolOp } from "./toolOps";
@@ -43,8 +43,16 @@ interface Props {
   onModel: (v: string) => void;
   onMode: (id: string) => void;
   onEffort: (v: string) => void;
+  onInsertCode: (code: string) => void;
+  onYolo: (v: boolean) => void;
+  onUnqueue: (index: number) => void;
+  onListSessions: () => Promise<SessionSummary[]>;
+  onOpenSession: (sessionId: string, title?: string) => void;
+  historyKey: number;
   focusKey: number;
 }
+
+const InsertCtx = createContext<((code: string) => void) | null>(null);
 
 const STATUS_ICON: Record<string, string> = { pending: "○", in_progress: "◐", completed: "✓", failed: "✕" };
 
@@ -128,11 +136,19 @@ function CopyButton({ text }: { text: string }) {
 }
 
 function CodeBlock({ lang, code }: { lang: string; code: string }) {
+  const insert = useContext(InsertCtx);
   return (
-    <div className="md-code">
+    <div className="md-code" data-testid="code-block">
       <div className="md-code-head">
         <span>{lang || "code"}</span>
-        <CopyButton text={code} />
+        <span className="md-code-actions">
+          {insert && (
+            <button className="copy-btn" data-testid="code-insert" title="Insert at the editor cursor" onClick={() => insert(code)}>
+              Insert
+            </button>
+          )}
+          <CopyButton text={code} />
+        </span>
       </div>
       <CodeLines code={code} language={normLang(lang)} />
     </div>
@@ -171,7 +187,7 @@ function OpView({ op, onOpenPath }: { op: ToolOp; onOpenPath: (p: string, line?:
     const add = d.filter((x) => x.t === "add").length;
     const del = d.filter((x) => x.t === "del").length;
     return (
-      <div className="op">
+      <div className="op" data-testid="op-edit">
         <div className="op-head">
           <span className="op-verb">Edited</span>
           <FileChip path={op.path} onOpen={onOpenPath} />
@@ -187,7 +203,7 @@ function OpView({ op, onOpenPath }: { op: ToolOp; onOpenPath: (p: string, line?:
   if (op.type === "write") {
     const n = op.content.replace(/\n$/, "").split("\n").length;
     return (
-      <div className="op">
+      <div className="op" data-testid="op-write">
         <div className="op-head">
           <span className="op-verb">Wrote</span>
           <FileChip path={op.path} onOpen={onOpenPath} />
@@ -206,7 +222,7 @@ function OpView({ op, onOpenPath }: { op: ToolOp; onOpenPath: (p: string, line?:
   }
   if (op.type === "bash") {
     return (
-      <div className="op">
+      <div className="op" data-testid="op-bash">
         <div className="op-cmd">
           <span className="prompt">$</span>
           <code>{op.command}</code>
@@ -251,7 +267,7 @@ function ToolCard({ call, onOpenPath }: { call: ToolCall; onOpenPath: (p: string
   }
 
   return (
-    <div className={"tool " + status}>
+    <div className={"tool " + status} data-testid="tool-card" data-status={status}>
       <div className="tool-head" onClick={() => output && setShowOut(!showOut)}>
         <span className={"tool-status-icon " + status}>{STATUS_ICON[status]}</span>
         <span className="tool-kind">{name}</span>
@@ -377,6 +393,9 @@ function ChatTabs({
       {chats.map((c) => (
         <div
           key={c.key}
+          data-testid="chat-tab"
+          data-key={c.key}
+          data-busy={c.busy ? "1" : "0"}
           className={"chat-tab" + (c.key === activeKey ? " active" : "")}
           title={c.title}
           onClick={() => onSelect(c.key)}
@@ -401,7 +420,7 @@ function ChatTabs({
           </span>
         </div>
       ))}
-      <button className="icon-btn chat-tab-new" title="New chat (runs in parallel)" onClick={onNew}>
+      <button className="icon-btn chat-tab-new" data-testid="chat-new" title="New chat (runs in parallel)" onClick={onNew}>
         ＋
       </button>
     </div>
@@ -439,6 +458,8 @@ function EffortPicker({ value, disabled, onPick }: { value: string; disabled: bo
   return (
     <div className="model-picker" ref={ref}>
       <button
+        data-testid="effort-btn"
+        data-value={cur.value}
         className={"model-btn effort-btn effort-" + (cur.value || "default")}
         disabled={disabled}
         title="Reasoning effort (restarts maki and resumes this chat)"
@@ -453,6 +474,8 @@ function EffortPicker({ value, disabled, onPick }: { value: string; disabled: bo
           {EFFORTS.map((e) => (
             <div
               key={e.value}
+              data-testid="effort-item"
+              data-value={e.value}
               className={"model-item" + (e.value === value ? " current" : "")}
               onMouseDown={(ev) => {
                 ev.preventDefault();
@@ -466,6 +489,91 @@ function EffortPicker({ value, disabled, onPick }: { value: string; disabled: bo
               {e.value === value && <span className="check">✓</span>}
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ago(iso?: string) {
+  if (!iso) return "";
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 90) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
+function HistoryPicker({
+  openKey,
+  onList,
+  onOpen,
+  openIds,
+}: {
+  openKey: number;
+  onList: () => Promise<SessionSummary[]>;
+  onOpen: (sessionId: string, title?: string) => void;
+  openIds: string[];
+}) {
+  const { open, setOpen, ref } = usePopover();
+  const [list, setList] = useState<SessionSummary[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [q, setQ] = useState("");
+
+  const load = () => {
+    setList(null);
+    setError(null);
+    onList()
+      .then((l) => setList(l))
+      .catch((e) => setError(String(e)));
+  };
+
+  useEffect(() => {
+    if (openKey > 0) {
+      setOpen(true);
+      load();
+    }
+  }, [openKey]);
+
+  const shown = (list ?? []).filter((x) => !q || (x.title ?? "").toLowerCase().includes(q.toLowerCase()));
+
+  return (
+    <div className="model-picker" ref={ref}>
+      <button
+        className="icon-btn"
+        data-testid="history-btn"
+        title="Chat history"
+        onClick={() => {
+          if (!open) load();
+          setOpen(!open);
+        }}
+      >
+        🕘
+      </button>
+      {open && (
+        <div className="model-pop history-pop" data-testid="history-pop">
+          <input autoFocus value={q} placeholder="Search past chats…" onChange={(e) => setQ(e.target.value)} />
+          <div className="model-list">
+            {error && <div className="quick-empty">{error}</div>}
+            {!error && list === null && <div className="quick-empty">Loading…</div>}
+            {list && shown.length === 0 && <div className="quick-empty">No past chats for this folder</div>}
+            {shown.map((x) => (
+              <div
+                key={x.sessionId}
+                data-testid="history-item"
+                data-session={x.sessionId}
+                className={"model-item history-item" + (openIds.includes(x.sessionId) ? " current" : "")}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  setOpen(false);
+                  onOpen(x.sessionId, x.title?.slice(0, 40));
+                }}
+              >
+                <span className="history-title">{x.title || "Untitled chat"}</span>
+                <span className="effort-hint">{openIds.includes(x.sessionId) ? "open" : ago(x.updatedAt)}</span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -499,7 +607,7 @@ function ModelPicker({ model, disabled, onPick }: { model: ConfigOption; disable
   const cur = model.currentValue;
   return (
     <div className="model-picker" ref={ref}>
-      <button className="model-btn" disabled={disabled} title={cur} onClick={() => { setOpen(!open); setIdx(0); }}>
+      <button className="model-btn" data-testid="model-btn" disabled={disabled} title={cur} onClick={() => { setOpen(!open); setIdx(0); }}>
         {shortName(cur)}
         {cur.endsWith("-1m") && <span className="badge-1m">1M</span>}
         <span className="caret">▾</span>
@@ -508,6 +616,7 @@ function ModelPicker({ model, disabled, onPick }: { model: ConfigOption; disable
         <div className="model-pop">
           <input
             autoFocus
+            data-testid="model-search"
             value={q}
             placeholder={`Search ${model.options.length} models… (e.g. opus 5.5 1m)`}
             onChange={(e) => { setQ(e.target.value); setIdx(0); }}
@@ -527,6 +636,8 @@ function ModelPicker({ model, disabled, onPick }: { model: ConfigOption; disable
                 <div key={v}>
                   {header && <div className="model-group">{provider}</div>}
                   <div
+                    data-testid="model-item"
+                    data-value={v}
                     className={"model-item" + (i === idx ? " active" : "") + (v === cur ? " current" : "")}
                     onMouseEnter={() => setIdx(i)}
                     onMouseDown={(e) => { e.preventDefault(); pick(v); }}
@@ -558,6 +669,7 @@ export default function Chat(props: Props) {
     modes: ch?.modes ?? [],
     usage: ch?.usage,
     effort: ch?.effort ?? "",
+    yolo: !!ch?.yolo,
   };
   const [input, setInput] = useState("");
   const [images, setImages] = useState<PastedImage[]>([]);
@@ -636,7 +748,7 @@ export default function Chat(props: Props) {
   };
 
   const submit = () => {
-    if ((!input.trim() && images.length === 0) || p.busy || !p.ready) return;
+    if ((!input.trim() && images.length === 0) || !p.ready) return;
     setStickToBottom(true);
     p.onSend(input.trim() || "Analyze the attached image(s) and tell me what needs to be done.", images);
     setInput("");
@@ -660,7 +772,8 @@ export default function Chat(props: Props) {
   }, [p.model]);
 
   return (
-    <div className="chat">
+    <InsertCtx.Provider value={p.onInsertCode}>
+    <div className="chat" data-testid="chat">
       <ChatTabs
         chats={p.chats}
         activeKey={ch?.key}
@@ -696,6 +809,26 @@ export default function Chat(props: Props) {
             {modelVariants.is1M ? "1M" : "200K"}
           </button>
         )}
+        <button
+          className={"ctx-toggle-btn yolo-btn" + (p.yolo ? " active" : "")}
+          data-testid="yolo-btn"
+          data-on={p.yolo ? "1" : "0"}
+          title={
+            p.yolo
+              ? "Auto-run is ON: maki runs tools without asking. Click to turn off."
+              : "Auto-run is OFF: maki asks before risky actions. Click to turn on."
+          }
+          disabled={!p.ready || p.busy}
+          onClick={() => p.onYolo(!p.yolo)}
+        >
+          ⚡ Auto
+        </button>
+        <HistoryPicker
+          openKey={p.historyKey}
+          onList={p.onListSessions}
+          onOpen={p.onOpenSession}
+          openIds={p.chats.map((c) => c.sessionId).filter(Boolean) as string[]}
+        />
       </div>
 
       <div
@@ -728,7 +861,7 @@ export default function Chat(props: Props) {
           switch (it.kind) {
             case "user":
               return (
-                <div key={i} className="msg user">
+                <div key={i} className="msg user" data-testid="msg-user">
                   {it.context && it.context.length > 0 && (
                     <div className="msg-chips">
                       {it.context.map((c, ci) => (
@@ -750,7 +883,7 @@ export default function Chat(props: Props) {
               );
             case "agent":
               return (
-                <div key={i} className="msg agent">
+                <div key={i} className="msg agent" data-testid="msg-agent">
                   <MarkdownView text={it.text} />
                 </div>
               );
@@ -784,14 +917,21 @@ export default function Chat(props: Props) {
           }
         })}
         {p.permission && (
-          <div className="permission">
+          <div className="permission" data-testid="permission">
             <div className="perm-title">
               Permission required: <b>{p.permission.toolCall.title ?? p.permission.toolCall.kind}</b>
+            </div>
+            <div className="perm-detail">
+              {toolOps(undefined, p.permission.toolCall.rawInput).map((o, i) => (
+                <OpView key={i} op={o} onOpenPath={p.onOpenPath} />
+              ))}
             </div>
             <div className="perm-btns">
               {p.permission.options.map((o) => (
                 <button
                   key={o.optionId}
+                  data-testid="perm-option"
+                  data-kind={o.kind}
                   className={o.kind.startsWith("allow") ? "primary" : ""}
                   onClick={() => p.onPermission(o.optionId)}
                 >
@@ -840,6 +980,18 @@ export default function Chat(props: Props) {
           </div>
         )}
 
+        {ch && ch.queued.length > 0 && (
+          <div className="queued" data-testid="queued">
+            {ch.queued.map((q, i) => (
+              <div key={i} className="queued-item" title={q}>
+                <span className="queued-label">Queued</span>
+                <span className="queued-text">{q}</span>
+                <span className="queued-x" onClick={() => p.onUnqueue(i)}>×</span>
+              </div>
+            ))}
+          </div>
+        )}
+
         {images.length > 0 && (
           <div className="thumbs">
             {images.map((im, i) => (
@@ -868,9 +1020,16 @@ export default function Chat(props: Props) {
 
         <textarea
           ref={taRef}
+          data-testid="chat-input"
           value={input}
           rows={Math.min(8, Math.max(3, input.split("\n").length))}
-          placeholder={p.ready ? "Ask maki… (@ to mention file, ⌘V paste image)" : "Connecting to maki…"}
+          placeholder={
+            !p.ready
+              ? "Connecting to maki…"
+              : p.busy
+                ? "maki is working. Type to queue the next message…"
+                : "Ask maki… (@ to mention file, ⌘V paste image)"
+          }
           onChange={(e) => handleInputChange(e.target.value, e.target.selectionStart ?? undefined)}
           onPaste={(e) => {
             const files = Array.from(e.clipboardData.items)
@@ -954,21 +1113,25 @@ export default function Chat(props: Props) {
               </span>
             )}
           </div>
-          {p.busy ? (
-            <button className="danger" onClick={p.onCancel}>
-              ■ Stop
-            </button>
-          ) : (
+          <div className="composer-right">
+            {p.busy && (
+              <button className="danger" data-testid="chat-stop" onClick={p.onCancel}>
+                ■ Stop
+              </button>
+            )}
             <button
               className="primary"
+              data-testid="chat-send"
               onClick={submit}
               disabled={!p.ready || (!input.trim() && images.length === 0)}
+              title={p.busy ? "Queue this message; it is sent when maki finishes" : "Send"}
             >
-              Send ↵
+              {p.busy ? "Queue ↵" : "Send ↵"}
             </button>
-          )}
+          </div>
         </div>
       </div>
     </div>
+    </InsertCtx.Provider>
   );
 }

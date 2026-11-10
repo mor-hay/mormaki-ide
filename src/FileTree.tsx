@@ -87,6 +87,8 @@ function Dir({
               className={"tree-row" + (e.path === active ? " active" : "") + (isChanged ? " changed" : "")}
               style={{ paddingLeft: 10 + depth * 13 }}
               title={`${e.path} (Right-click for options)`}
+              data-testid="tree-row"
+              data-path={e.path}
               onClick={() => (e.is_dir ? setOpen((o) => ({ ...o, [e.path]: !o[e.path] })) : onOpen(e.path))}
               onContextMenu={(ev) => onContextMenu(ev, e)}
             >
@@ -126,6 +128,10 @@ export default function FileTree(props: {
   onOpen: (p: string) => void;
   onOpenTerminal: (dir: string) => void;
   onAttachChat: (p: string) => void;
+  onNewFile: (dir: string) => void;
+  onNewFolder: (dir: string) => void;
+  onRename: (path: string) => void;
+  onDelete: (path: string) => void;
   onRefresh: () => void;
   onQuickOpen: () => void;
   active?: string;
@@ -154,7 +160,7 @@ export default function FileTree(props: {
     ev.stopPropagation();
     setMenu({
       x: Math.min(ev.clientX, window.innerWidth - 210),
-      y: Math.min(ev.clientY, window.innerHeight - 140),
+      y: Math.min(ev.clientY, window.innerHeight - 290),
       path: entry.path,
       is_dir: entry.is_dir,
       name: entry.name,
@@ -173,7 +179,7 @@ export default function FileTree(props: {
         ev.preventDefault();
         setMenu({
           x: Math.min(ev.clientX, window.innerWidth - 210),
-          y: Math.min(ev.clientY, window.innerHeight - 140),
+          y: Math.min(ev.clientY, window.innerHeight - 290),
           path: props.root,
           is_dir: true,
           name: props.root.split("/").pop() ?? "workspace",
@@ -194,6 +200,9 @@ export default function FileTree(props: {
           </button>
           <button className="icon-btn" title="Quick Open (⌘P)" onClick={props.onQuickOpen}>
             🔍
+          </button>
+          <button className="icon-btn" title="New File…" data-testid="tree-new-file" onClick={() => props.onNewFile(props.root)}>
+            ＋
           </button>
           <button className="icon-btn" title="Collapse All" onClick={() => setCollapseKey((k) => k + 1)}>
             ⊟
@@ -220,10 +229,60 @@ export default function FileTree(props: {
       {menu && (
         <div
           className="ctx-menu"
+          data-testid="ctx-menu"
           style={{ left: menu.x, top: menu.y }}
           onClick={(e) => e.stopPropagation()}
         >
           <div className="ctx-head">{menu.name}</div>
+          <div
+            className="ctx-item"
+            data-testid="ctx-new-file"
+            onClick={() => {
+              props.onNewFile(menu.is_dir ? menu.path : parentDir(menu.path));
+              setMenu(null);
+            }}
+          >
+            <span>＋</span>
+            <span>New File…</span>
+          </div>
+          <div
+            className="ctx-item"
+            data-testid="ctx-new-folder"
+            onClick={() => {
+              props.onNewFolder(menu.is_dir ? menu.path : parentDir(menu.path));
+              setMenu(null);
+            }}
+          >
+            <span>▣</span>
+            <span>New Folder…</span>
+          </div>
+          {menu.path !== props.root && (
+            <>
+              <div
+                className="ctx-item"
+                data-testid="ctx-rename"
+                onClick={() => {
+                  props.onRename(menu.path);
+                  setMenu(null);
+                }}
+              >
+                <span>✎</span>
+                <span>Rename…</span>
+              </div>
+              <div
+                className="ctx-item ctx-danger"
+                data-testid="ctx-delete"
+                onClick={() => {
+                  props.onDelete(menu.path);
+                  setMenu(null);
+                }}
+              >
+                <span>🗑</span>
+                <span>Move to Trash</span>
+              </div>
+            </>
+          )}
+          <div className="ctx-sep" />
           <div
             className="ctx-item"
             onClick={() => {

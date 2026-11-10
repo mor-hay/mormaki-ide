@@ -4,14 +4,30 @@ A Cursor-like AI code editor and [Maki](https://maki.sh) Lua plugin powered by `
 
 ## Features
 
-- **Monaco Code Editor** — Multi-tab editing, syntax highlighting, dirty indicators, and line-number jumps.
-- **Maki ACP Chat Panel** — Streaming responses, collapsible thinking blocks, Markdown + code-block copy, live tool-call cards, plan checklists, model & mode (`Build` / `Plan`) switching, and context usage meter.
-- **Inline Edit (`⌘K`) & Add to Chat (`⌘L`)** — Highlight code and press `⌘K` for inline AI edits or `⌘L` to attach code ranges to chat.
-- **Visual Diff Review** — Accept or Reject AI file edits (including automatic cleanup of newly created files on Reject).
-- **Quick Open (`⌘P`) & `@file` Mentions** — Fuzzy file search modal and `@` file autocomplete directly in the chat composer.
-- **Vision Support (`⌘V` / Drag & Drop)** — Paste screenshots or drop images directly into the chat for visual analysis.
-- **Integrated Multi-Tab Terminal (`⌘J` / Right-Click)** — Full interactive PTY shell (`xterm.js` + `portable-pty`). Right-click any folder or file in the explorer and choose **Open in Integrated Terminal**, or open multiple terminal tabs with `＋`.
-- **Maki Plugin Integration** — Adds `/ide` and `/mormaki` slash commands and the `open_mormaki_ide` tool inside `maki`.
+- **Editor**: Monaco with tabs, syntax highlighting, quick open (`⌘P`), command palette (`⇧⌘P`), status bar.
+- **Explorer**: new file/folder, rename, move to Trash, open a terminal in any folder (right-click).
+- **Search in files** (`⇧⌘F`) with jump-to-line and match-case.
+- **Source Control**: changed files, diff against `HEAD`, stage, unstage, discard, commit.
+- **Integrated terminal** (`⌘J`): real PTY shells, multiple tabs.
+- **AI chat on `maki acp`**:
+  - several chats in parallel, each with its own maki process, model, mode and reasoning effort
+  - code edits shown as diffs; new files and shell commands shown inline; highlighted code blocks with Insert/Copy
+  - review bar to Accept or Reject every file maki changed (Reject restores the exact previous content)
+  - message queue while maki is working, Stop, auto-run toggle (`--yolo`), permission prompts
+  - chat history: reopen any past session for the folder; open chats survive restarts
+  - `@file` mentions, `⌘L` add selection to chat, `⌘K` inline edit, paste or drop images
+- **Maki plugin**: `/ide` and `/mormaki` commands and the `open_mormaki_ide` tool.
+
+Not included: Cursor-style Tab autocomplete, and language-server features (errors, go-to-definition).
+
+Reasoning effort is applied through the `MORMAKI_THINKING` environment variable. To make it take effect, add to `~/.config/maki/init.lua`:
+
+```lua
+local effort = maki.uv.os_getenv("MORMAKI_THINKING")
+if effort and effort ~= "" then
+  maki.setup({ always_thinking = tonumber(effort) or effort })
+end
+```
 
 ## Install as a Maki Plugin
 
@@ -37,3 +53,16 @@ To build a standalone native `.app` / binary:
 ```bash
 npm run tauri build
 ```
+
+## End-to-end tests
+
+```bash
+npm run tauri build -- --bundles app
+python3 e2e/run.py            # all tests
+python3 e2e/run.py t08 t13    # only matching tests
+```
+
+The suite launches the real release binary on a throwaway git repo and drives the real webview
+through an automation port that only exists when `MORMAKI_E2E_PORT` is set (loopback only).
+Chat tests talk to real `maki acp`, so they need a logged-in maki and spend a few cents
+(model: `MORMAKI_E2E_MODEL`, default `anthropic/claude-haiku-4-5`).

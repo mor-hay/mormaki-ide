@@ -6,10 +6,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { ContentBlock, ToolCall } from "./acp";
 import { useChats } from "./useChats";
-import { editedPaths, toolOps } from "./toolOps";
+import { editedPaths, toolOps, ToolOp } from "./toolOps";
 import Chat, { ContextChip, PastedImage } from "./Chat";
 import FileTree, { fileBadge } from "./FileTree";
 import TerminalPanel, { TermSession } from "./TerminalPanel";
+import SearchPanel from "./SearchPanel";
+import GitPanel, { GitStatus } from "./GitPanel";
+import CommandPalette, { Command } from "./CommandPalette";
+import { DialogHost, askConfirm, askText } from "./dialogs";
 import { langFor } from "./monaco";
 import "./App.css";
 
@@ -25,6 +29,15 @@ interface Change {
 
 const rel = (root: string, p: string) => (p.startsWith(root + "/") ? p.slice(root.length + 1) : p);
 const readOrNull = (path: string) => invoke<string>("read_file", { path }).catch(() => null);
+const dirOf = (p: string) => (p.lastIndexOf("/") > 0 ? p.slice(0, p.lastIndexOf("/")) : "/");
+const under = (p: string, base: string) => p === base || p.startsWith(base + "/");
+const recentWorkspaces = (): string[] => {
+  try {
+    return JSON.parse(localStorage.getItem("recent_workspaces") ?? "[]");
+  } catch {
+    return [];
+  }
+};
 
 declare global {
   interface Window {
@@ -51,6 +64,15 @@ export default function App() {
   const [quickIdx, setQuickIdx] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
 
+  const [sideView, setSideView] = useState<"files" | "search" | "git">("files");
+  const [searchFocus, setSearchFocus] = useState(0);
+  const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
+  const [gitTick, setGitTick] = useState(0);
+  const [palette, setPalette] = useState(false);
+  const [historyKey, setHistoryKey] = useState(0);
+  const [cursor, setCursor] = useState({ line: 1, col: 1 });
+  const e2eRef = useRef(false);
+
   const [context, setContext] = useState<ContextChip[]>([]);
   const [chatFocus, setChatFocus] = useState(0);
 
@@ -65,6 +87,7 @@ export default function App() {
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor>(undefined);
   const pendingLineRef = useRef<number | undefined>(undefined);
   const termCounter = useRef(1);
+  const pendingSnap = useRef(new Set<string>());
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -115,28 +138,96 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    invoke<string | null>("get_initial_workspace")
+    invoke<{ path: string | null; e2e: boolean }>("get_initial_workspace")
       .then((w) => {
-        if (w) {
-          localStorage.setItem("workspace", w);
-          setRoot(w);
+        e2eRef.current = w.e2e;
+        if (w.path) {
+          if (!w.e2e) localStorage.setItem("workspace", w.path);
+          setRoot(w.path);
         }
       })
       .catch(() => {});
   }, []);
 
   useEffect(() => {
+    if (!root || e2eRef.current) return;
+    const list = [root, ...recentWorkspaces().filter((r) => r !== root)].slice(0, 8);
+    localStorage.setItem("recent_workspaces", JSON.stringify(list));
+  }, [root]);
+
+  useEffect(() => {
+    if (!root) return;
+    let alive = true;
+    invoke<GitStatus>("git_status", { root })
+      .then((st) => alive && setGitStatus(st))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [root, gitTick, treeRefresh]);
+
+  useEffect(() => {
+    const onFocus = () => setGitTick((n) => n + 1);
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
+  useEffect(() => {
     if (root) refreshFiles(root);
   }, [root, treeRefresh, refreshFiles]);
 
-  const snapshot = useCallback(async (path: string, before?: string | null) => {
+  const record = useCallback((path: string, before: string | null) => {
     if (path in changesRef.current) return;
-    const tab = tabsRef.current.find((t) => t.path === path);
-    const base = before !== undefined ? before : tab ? tab.saved : await readOrNull(path);
-    if (path in changesRef.current) return;
-    changesRef.current = { ...changesRef.current, [path]: { before: base } };
+    changesRef.current = { ...changesRef.current, [path]: { before } };
     setChanges(changesRef.current);
   }, []);
+
+  /**
+   * Remember what `path` looked like before maki touched it, so Reject can restore it.
+   * maki writes files itself and may already have done so by the time we look, so decide
+   * from file times relative to `startedAt` (when the tool call was announced) instead of
+   * trusting a racy read.
+   */
+  const snapshot = useCallback(
+    async (path: string, ops: ToolOp[] = [], startedAt = Date.now(), known?: string | null) => {
+      if (path in changesRef.current || pendingSnap.current.has(path)) return;
+      if (known !== undefined) return record(path, known);
+      const tab = tabsRef.current.find((t) => t.path === path);
+      if (tab) return record(path, tab.saved);
+      pendingSnap.current.add(path);
+      try {
+        type Meta = { exists: boolean; created_ms: number; modified_ms: number };
+        const meta = () => invoke<Meta>("file_meta", { path });
+        let m1 = await meta();
+        if (!m1.exists || m1.created_ms >= startedAt - 5) return record(path, null);
+        let content = await readOrNull(path);
+        let m2 = await meta();
+        if (m2.modified_ms !== m1.modified_ms) {
+          content = await readOrNull(path);
+          m1 = m2;
+        }
+        if (content === null) return record(path, null);
+        if (m1.modified_ms < startedAt - 5) return record(path, content);
+        let restored: string | null = content;
+        const edits = ops.filter((o) => o.type === "edit" && o.path === path).reverse() as Extract<ToolOp, { type: "edit" }>[];
+        if (edits.length === 0) restored = null;
+        for (const e of edits) {
+          if (restored !== null && e.newText && restored.includes(e.newText)) {
+            restored = restored.replace(e.newText, () => e.oldText);
+          } else {
+            restored = null;
+          }
+        }
+        if (restored === null && root) {
+          restored = await invoke<string | null>("git_show_head", { root, path }).catch(() => null);
+        }
+        record(path, restored ?? content);
+      } finally {
+        pendingSnap.current.delete(path);
+      }
+    },
+    [record, root],
+  );
 
   const reloadFromDisk = useCallback(async (path: string) => {
     const content = await readOrNull(path);
@@ -148,15 +239,15 @@ export default function App() {
   }, []);
 
   const onToolCall = useCallback(
-    (call: ToolCall, replaying: boolean) => {
+    (call: ToolCall, replaying: boolean, startedAt: number) => {
       if (replaying) return;
       const ops = toolOps(call.toolName, call.rawInput);
       for (const c of call.content ?? []) {
-        if (c.type === "diff") snapshot(c.path as string, (c.oldText as string | null) ?? null);
+        if (c.type === "diff") snapshot(c.path as string, ops, startedAt, (c.oldText as string | null) ?? null);
       }
-      if (call.status !== "completed" && call.status !== "failed") {
-        editedPaths(ops).forEach((p) => snapshot(p));
-        if (call.kind === "edit") call.locations?.forEach((l) => snapshot(l.path));
+      if (call.status !== "failed") {
+        editedPaths(ops).forEach((p) => snapshot(p, ops, startedAt));
+        if (call.kind === "edit") call.locations?.forEach((l) => snapshot(l.path, ops, startedAt));
       }
       if (call.status === "completed") {
         setTreeRefresh((n) => n + 1);
@@ -213,10 +304,14 @@ export default function App() {
   );
 
   const closeTab = useCallback(
-    (path: string) => {
+    async (path: string) => {
       const tab = tabsRef.current.find((t) => t.path === path);
       if (tab && tab.value !== tab.saved) {
-        if (!window.confirm(`Discard unsaved changes in ${path.split("/").pop()}?`)) return;
+        const ok = await askConfirm(`Discard unsaved changes in ${path.split("/").pop()}?`, undefined, {
+          confirmLabel: "Discard",
+          danger: true,
+        });
+        if (!ok) return;
       }
       setTabs((ts) => ts.filter((t) => t.path !== path));
       if (active === path) {
@@ -235,11 +330,107 @@ export default function App() {
     try {
       await invoke("write_file", { path: t.path, content: t.value });
       setTabs((ts) => ts.map((x) => (x.path === t.path ? { ...x, saved: x.value } : x)));
+      setGitTick((n) => n + 1);
       showToast(`Saved ${t.path.split("/").pop()}`);
     } catch (e) {
       showToast(`Failed to save: ${String(e)}`);
     }
   }, [active, showToast]);
+
+  const newFile = useCallback(
+    async (dir: string) => {
+      const name = await askText("New file", "", "Create");
+      if (!name) return;
+      const path = `${dir}/${name}`;
+      try {
+        await invoke("create_file", { path });
+        setTreeRefresh((n) => n + 1);
+        openFile(path);
+      } catch (e) {
+        showToast(`Could not create file: ${String(e)}`);
+      }
+    },
+    [openFile, showToast],
+  );
+
+  const newFolder = useCallback(
+    async (dir: string) => {
+      const name = await askText("New folder", "", "Create");
+      if (!name) return;
+      try {
+        await invoke("create_dir", { path: `${dir}/${name}` });
+        setTreeRefresh((n) => n + 1);
+      } catch (e) {
+        showToast(`Could not create folder: ${String(e)}`);
+      }
+    },
+    [showToast],
+  );
+
+  const renamePath = useCallback(
+    async (path: string) => {
+      const old = path.split("/").pop() ?? "";
+      const name = await askText(`Rename ${old}`, old, "Rename");
+      if (!name || name === old) return;
+      const to = `${dirOf(path)}/${name}`;
+      try {
+        await invoke("rename_path", { from: path, to });
+        const move = (p: string) => (under(p, path) ? to + p.slice(path.length) : p);
+        setTabs((ts) => ts.map((t) => ({ ...t, path: move(t.path) })));
+        setActive((cur) => (cur ? move(cur) : cur));
+        setTreeRefresh((n) => n + 1);
+      } catch (e) {
+        showToast(`Could not rename: ${String(e)}`);
+      }
+    },
+    [showToast],
+  );
+
+  const deletePath = useCallback(
+    async (path: string) => {
+      const name = path.split("/").pop() ?? path;
+      const ok = await askConfirm(`Move "${name}" to the Trash?`, "You can restore it from the Trash.", {
+        confirmLabel: "Move to Trash",
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        await invoke("trash_path", { path });
+        const rest = tabsRef.current.filter((t) => !under(t.path, path));
+        setTabs(rest);
+        setActive((cur) => (cur && under(cur, path) ? rest[rest.length - 1]?.path : cur));
+        setTreeRefresh((n) => n + 1);
+      } catch (e) {
+        showToast(`Could not delete: ${String(e)}`);
+      }
+    },
+    [showToast],
+  );
+
+  const openGitDiff = useCallback(
+    async (path: string) => {
+      if (!root) return;
+      const before = (await invoke<string | null>("git_show_head", { root, path }).catch(() => null)) ?? "";
+      const after = (await readOrNull(path)) ?? "";
+      setReview({ path, before, after });
+    },
+    [root],
+  );
+
+  const insertCode = useCallback(
+    (code: string) => {
+      const ed = editorRef.current;
+      const sel = ed?.getSelection();
+      if (!ed || !sel || !ed.getModel() || !tabsRef.current.length) {
+        showToast("Open a file first, then insert at the cursor");
+        return;
+      }
+      setReview(null);
+      ed.executeEdits("chat-insert", [{ range: sel, text: code, forceMoveMarkers: true }]);
+      ed.focus();
+    },
+    [showToast],
+  );
 
   const attachFileToContext = useCallback(
     async (path: string) => {
@@ -261,8 +452,8 @@ export default function App() {
     async (text: string, extra: ContextChip[] = context, images: PastedImage[] = []) => {
       const chat = chatApi.active;
       if (!chat || !root) return;
-      if (chat.busy || !chat.ready) {
-        showToast(chat.busy ? "This chat is busy. Open a new chat (＋) to run in parallel." : "maki is still starting…");
+      if (!chat.ready) {
+        showToast("maki is still starting…");
         return;
       }
       const blocks: ContentBlock[] = [
@@ -332,6 +523,8 @@ export default function App() {
 
   const onMount: OnMount = (ed) => {
     editorRef.current = ed;
+    ((window as any).__mormaki ??= {}).editor = ed;
+    ed.onDidChangeCursorPosition((e) => setCursor({ line: e.position.lineNumber, col: e.position.column }));
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => handlers.current.save());
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL, () => handlers.current.addSelectionToChat());
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK, () => handlers.current.openInline());
@@ -349,7 +542,14 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "p") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        setPalette((v) => !v);
+      } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        setSideView("search");
+        setSearchFocus((n) => n + 1);
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "p") {
         e.preventDefault();
         setQuickQuery("");
         setQuickIdx(0);
@@ -396,17 +596,20 @@ export default function App() {
     if (review?.path === path) setReview(null);
   };
 
+  const openWorkspace = (dir: string) => {
+    if (!e2eRef.current) localStorage.setItem("workspace", dir);
+    setTabs([]);
+    setActive(undefined);
+    changesRef.current = {};
+    setChanges({});
+    setReview(null);
+    setGitStatus(null);
+    setRoot(dir);
+  };
+
   const pickFolder = async () => {
     const dir = await openDialog({ directory: true });
-    if (typeof dir === "string") {
-      localStorage.setItem("workspace", dir);
-      setTabs([]);
-      setActive(undefined);
-      changesRef.current = {};
-      setChanges({});
-      setReview(null);
-      setRoot(dir);
-    }
+    if (typeof dir === "string") openWorkspace(dir);
   };
 
   const startResize = (side: "left" | "right", startX: number) => {
@@ -463,6 +666,17 @@ export default function App() {
           <button className="primary lg" onClick={pickFolder}>
             Open Workspace Folder…
           </button>
+          {recentWorkspaces().length > 0 && (
+            <div className="recents">
+              <div className="recents-title">Recent</div>
+              {recentWorkspaces().map((r) => (
+                <div key={r} className="recent-item" title={r} onClick={() => openWorkspace(r)}>
+                  <span>{r.split("/").pop()}</span>
+                  <span className="recent-path">{r}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -471,8 +685,36 @@ export default function App() {
   const tab = tabs.find((t) => t.path === active);
   const changedPaths = Object.keys(changes);
   const dirtyPaths = tabs.filter((t) => t.value !== t.saved).map((t) => t.path);
+  const openQuick = () => {
+    setQuickQuery("");
+    setQuickIdx(0);
+    setQuickOpen(true);
+  };
+  const busyChats = chatApi.chats.filter((c) => c.busy).length;
+  const commands: Command[] = [
+    { id: "quick-open", title: "Go to File…", hint: "⌘P", run: openQuick },
+    { id: "search", title: "Search in Files", hint: "⇧⌘F", run: () => { setSideView("search"); setSearchFocus((n) => n + 1); } },
+    { id: "view-files", title: "View: Explorer", run: () => setSideView("files") },
+    { id: "view-git", title: "View: Source Control", run: () => setSideView("git") },
+    { id: "terminal-toggle", title: "Terminal: Toggle Panel", hint: "⌘J", run: toggleTerminalPanel },
+    { id: "terminal-new", title: "Terminal: New Terminal", run: () => openTerminalInDir(root) },
+    { id: "chat-new", title: "Chat: New Chat", run: chatApi.newChat },
+    { id: "chat-history", title: "Chat: Show History", run: () => setHistoryKey((n) => n + 1) },
+    { id: "chat-yolo", title: `Chat: ${activeChat?.yolo ? "Disable" : "Enable"} Auto-run (skip permission prompts)`, run: () => activeChat && chatApi.setYolo(activeChat.key, !activeChat.yolo) },
+    { id: "file-save", title: "File: Save", hint: "⌘S", run: save },
+    { id: "file-new", title: "File: New File…", run: () => newFile(root) },
+    { id: "folder-new", title: "File: New Folder…", run: () => newFolder(root) },
+    { id: "editor-close", title: "Editor: Close Tab", hint: "⌘W", run: () => active && closeTab(active) },
+    { id: "inline-edit", title: "AI: Inline Edit Selection", hint: "⌘K", run: openInline },
+    { id: "add-to-chat", title: "AI: Add Selection to Chat", hint: "⌘L", run: addSelectionToChat },
+    { id: "changes-accept", title: "AI Changes: Accept All", run: () => changedPaths.forEach((p) => resolveChange(p, true)) },
+    { id: "changes-reject", title: "AI Changes: Reject All", run: () => changedPaths.forEach((p) => resolveChange(p, false)) },
+    { id: "explorer-refresh", title: "Explorer: Refresh", run: () => setTreeRefresh((n) => n + 1) },
+    { id: "folder-open", title: "Workspace: Open Folder…", run: pickFolder },
+  ];
 
   return (
+    <div className="app-root">
     <div className="layout" style={{ gridTemplateColumns: `${sidebarWidth}px 4px minmax(0, 1fr) 4px ${chatWidth}px` }}>
       <aside className="sidebar">
         <div className="sidebar-top">
@@ -481,22 +723,63 @@ export default function App() {
             📁 Switch Folder…
           </button>
         </div>
-        <FileTree
-          root={root}
-          onOpen={(p) => openFile(p)}
-          onOpenTerminal={(dir) => openTerminalInDir(dir)}
-          onAttachChat={(p) => attachFileToContext(p)}
-          onRefresh={() => setTreeRefresh((n) => n + 1)}
-          onQuickOpen={() => {
-            setQuickQuery("");
-            setQuickIdx(0);
-            setQuickOpen(true);
-          }}
-          active={active}
-          refresh={treeRefresh}
-          changedPaths={changedPaths}
-          dirtyPaths={dirtyPaths}
-        />
+        <div className="activity">
+          {(
+            [
+              ["files", "Explorer"],
+              ["search", "Search"],
+              ["git", "Git"],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              data-testid={`view-${id}`}
+              className={"activity-btn" + (sideView === id ? " active" : "")}
+              onClick={() => {
+                setSideView(id);
+                if (id === "search") setSearchFocus((n) => n + 1);
+                if (id === "git") setGitTick((n) => n + 1);
+              }}
+            >
+              {label}
+              {id === "git" && gitStatus && gitStatus.files.length > 0 && (
+                <span className="count-pill">{gitStatus.files.length}</span>
+              )}
+            </button>
+          ))}
+        </div>
+        <div className="side-view" style={{ display: sideView === "files" ? "flex" : "none" }}>
+          <FileTree
+            root={root}
+            onOpen={(p) => openFile(p)}
+            onOpenTerminal={(dir) => openTerminalInDir(dir)}
+            onAttachChat={(p) => attachFileToContext(p)}
+            onNewFile={newFile}
+            onNewFolder={newFolder}
+            onRename={renamePath}
+            onDelete={deletePath}
+            onRefresh={() => setTreeRefresh((n) => n + 1)}
+            onQuickOpen={openQuick}
+            active={active}
+            refresh={treeRefresh}
+            changedPaths={changedPaths}
+            dirtyPaths={dirtyPaths}
+          />
+        </div>
+        <div className="side-view" style={{ display: sideView === "search" ? "flex" : "none" }}>
+          <SearchPanel root={root} focusKey={searchFocus} onOpen={(p, line) => openFile(p, line)} />
+        </div>
+        {sideView === "git" && (
+          <div className="side-view">
+            <GitPanel
+              root={root}
+              status={gitStatus}
+              onRefresh={() => setGitTick((n) => n + 1)}
+              onOpenDiff={openGitDiff}
+              onToast={showToast}
+            />
+          </div>
+        )}
       </aside>
 
       <div className="sash" onMouseDown={(e) => startResize("left", e.clientX)} />
@@ -510,6 +793,8 @@ export default function App() {
               return (
                 <div
                   key={t.path}
+                  data-testid="editor-tab"
+                  data-path={t.path}
                   className={"tab" + (t.path === active && !review ? " active" : "")}
                   title={rel(root, t.path)}
                   onClick={() => openFile(t.path)}
@@ -583,7 +868,7 @@ export default function App() {
         )}
 
         {changedPaths.length > 0 && (
-          <div className="changes-bar">
+          <div className="changes-bar" data-testid="changes-bar">
             <span className="changes-label">✦ {changedPaths.length} file(s) modified</span>
             <div className="changes-list">
               {changedPaths.map((p) => (
@@ -713,11 +998,23 @@ export default function App() {
         chats={chatApi.chats}
         onSelectChat={chatApi.setActiveKey}
         onNewChat={chatApi.newChat}
-        onCloseChat={(k) => {
+        onCloseChat={async (k) => {
           const c = chatApi.chats.find((x) => x.key === k);
-          if (c?.busy && !window.confirm("This chat is still working. Stop it and close?")) return;
+          if (c?.busy) {
+            const ok = await askConfirm("This chat is still working", "Stop it and close the tab?", {
+              confirmLabel: "Stop and close",
+              danger: true,
+            });
+            if (!ok) return;
+          }
           chatApi.closeChat(k);
         }}
+        onInsertCode={insertCode}
+        onYolo={(v) => activeChat && chatApi.setYolo(activeChat.key, v)}
+        onUnqueue={(i) => activeChat && chatApi.unqueue(activeChat.key, i)}
+        onListSessions={chatApi.listSessions}
+        onOpenSession={chatApi.openSession}
+        historyKey={historyKey}
         onPermission={(id) => activeChat && chatApi.answerPermission(activeChat.key, id)}
         onSend={(t, imgs) => send(t, context, imgs)}
         onCancel={() => activeChat && chatApi.cancel(activeChat.key)}
@@ -735,7 +1032,7 @@ export default function App() {
 
       {quickOpen && (
         <div className="modal-backdrop" onClick={() => setQuickOpen(false)}>
-          <div className="quick-open" onClick={(e) => e.stopPropagation()}>
+          <div className="quick-open" data-testid="quick-open" onClick={(e) => e.stopPropagation()}>
             <input
               autoFocus
               value={quickQuery}
@@ -790,7 +1087,32 @@ export default function App() {
         </div>
       )}
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && <div className="toast" data-testid="toast">{toast}</div>}
+    </div>
+      <div className="statusbar" data-testid="statusbar">
+        <span className="sb-item" title="Git branch" onClick={() => setSideView("git")}>
+          ⎇ {gitStatus?.is_repo ? gitStatus.branch || "detached" : "no git"}
+          {gitStatus && gitStatus.files.length > 0 ? ` • ${gitStatus.files.length}` : ""}
+        </span>
+        {changedPaths.length > 0 && <span className="sb-item sb-accent">✦ {changedPaths.length} AI change(s) to review</span>}
+        <span className="sb-spacer" />
+        {busyChats > 0 && (
+          <span className="sb-item">
+            <span className="spinner sm" /> {busyChats} chat{busyChats > 1 ? "s" : ""} working
+          </span>
+        )}
+        {tab && !review && (
+          <>
+            <span className="sb-item">Ln {cursor.line}, Col {cursor.col}</span>
+            <span className="sb-item">{langFor(tab.path)}</span>
+          </>
+        )}
+        <span className="sb-item" onClick={() => setPalette(true)} title="Command Palette (⇧⌘P)">
+          ⇧⌘P
+        </span>
+      </div>
+      {palette && <CommandPalette commands={commands} onClose={() => setPalette(false)} />}
+      <DialogHost />
     </div>
   );
 }
